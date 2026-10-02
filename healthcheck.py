@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 ALLOWED_HOST = "127.0.0.1"
@@ -133,6 +134,42 @@ def open_database(db_path):
     return conn
 
 
+# recent 所需的全部列（SELECT_SQL 的列顺序）
+REQUIRED_CHECK_COLUMNS = ("id", "url", "checked_at", "elapsed_ms", "status",
+                          "http_status", "reason")
+
+
+def _open_ro_uri(db_path, immutable):
+    uri = Path(db_path).resolve().as_uri() + (
+        "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    )
+    conn = sqlite3.connect(uri, uri=True)
+    # 立即执行一次真实读取：目录、非数据库文件、权限不足等问题在此暴露
+    conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    return conn
+
+
+def open_database_readonly(db_path):
+    """以只读模式打开既有数据库，绝不创建文件、目录或任何表。
+
+    路径不存在（含父目录不存在）返回 None；其余打开/读取失败以退出码 2 结束。
+    先用 mode=ro（正确读取 WAL 中未 checkpoint 的数据）；当文件或所在目录
+    只读、SQLite 无法建立 -shm 等侧车文件时，回退 immutable=1 再试，使只读
+    权限位的数据库（含 WAL 库干净关闭后的状态）也可查询。
+    """
+    if not os.path.exists(db_path):
+        return None
+    try:
+        return _open_ro_uri(db_path, immutable=False)
+    except sqlite3.Error as first_exc:
+        try:
+            return _open_ro_uri(db_path, immutable=True)
+        except sqlite3.Error:
+            # 两种只读方式都失败（目录、非数据库文件、无读权限等）：
+            # 报告初次失败原因，不尝试修复、重建或覆盖
+            die(f"读取数据库 {db_path!r} 失败: {first_exc}")
+
+
 def probe_once(port, target, timeout):
     """发送且仅发送一次 GET，不跟随重定向。
 
@@ -209,20 +246,37 @@ def command_check(args):
 
 def command_recent(args):
     db_path = args.db
-    # recent 只读历史：文件尚不存在时历史为空，不创建文件
-    if not os.path.exists(db_path):
+    # recent 严格只读：数据库或其父目录不存在时历史为空，不创建任何文件/目录
+    conn = open_database_readonly(db_path)
+    if conn is None:
         print("[]")
         return 0
 
     try:
-        conn = sqlite3.connect(db_path)
-        try:
-            conn.execute(CREATE_TABLE_SQL)
-            rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        die(f"读取数据库 {db_path!r} 失败: {exc}")
+        # checks 表不存在（空数据库或仅有其他表）时历史为空，不建表
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='checks'"
+        ).fetchone()
+        if exists is None:
+            rows = []
+        else:
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(checks)").fetchall()
+            }
+            missing = [c for c in REQUIRED_CHECK_COLUMNS if c not in columns]
+            if missing:
+                # 缺列时报错退出，不尝试修复、重建或覆盖
+                die(
+                    f"读取数据库 {db_path!r} 的 checks 表失败: "
+                    f"缺少字段 {', '.join(missing)}"
+                )
+            try:
+                rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
+            except sqlite3.Error as exc:
+                die(f"读取数据库 {db_path!r} 的 checks 表失败: {exc}")
+    finally:
+        conn.close()
 
     records = [
         {
