@@ -4,6 +4,7 @@
 用法：
     python healthcheck.py --db monitor.sqlite check --url http://127.0.0.1:8765/
     python healthcheck.py --db monitor.sqlite recent --limit 5
+    python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1 --limit 5
 """
 
 import argparse
@@ -51,6 +52,14 @@ VALUES (?, ?, ?, ?, ?, ?)
 SELECT_SQL = """
 SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
 FROM checks
+ORDER BY id DESC
+LIMIT ?
+"""
+
+SELECT_FILTERED_SQL = """
+SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
+FROM checks
+WHERE url = ?
 ORDER BY id DESC
 LIMIT ?
 """
@@ -222,6 +231,11 @@ def command_check(args):
 
 def command_recent(args):
     db_path = args.db
+    # URL 筛选优先于一切数据库判定：即使路径不存在或为目录，
+    # 非法筛选值也先报 URL 错误
+    if args.url is not None:
+        validate_target_url(args.url)
+
     # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
     # 不创建文件、不创建目录、不发任何网络请求
     if not os.path.exists(db_path):
@@ -252,6 +266,12 @@ def command_recent(args):
             if "checks" not in tables:
                 # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
                 rows = []
+            elif args.url is not None:
+                # 按数据库保存的原始 url 字符串精确匹配，
+                # 不合并、不规范化路径或查询参数
+                rows = conn.execute(
+                    SELECT_FILTERED_SQL, (args.url, args.limit)
+                ).fetchall()
             else:
                 rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
         finally:
@@ -295,6 +315,11 @@ def build_parser():
     p_check.set_defaults(handler=command_check)
 
     p_recent = subparsers.add_parser("recent", help="按 id 倒序查询最近检查记录")
+    p_recent.add_argument(
+        "--url",
+        default=None,
+        help="可选：仅返回该原始 URL 精确匹配的记录（规则同 check）",
+    )
     p_recent.add_argument(
         "--limit",
         type=positive_limit,

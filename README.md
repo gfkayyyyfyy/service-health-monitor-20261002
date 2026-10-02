@@ -9,7 +9,7 @@
 `healthcheck.py` 仅使用 Python 3 标准库，提供：
 
 - `check`：对**登记的单个 URL** 发送**一次** `GET`（不跟随重定向），将结果以一行 JSON 输出到标准输出并持久化到 SQLite；
-- `recent`：**只读**查询历史，按 `id` 倒序输出 JSON 数组；不新增表或记录、不创建数据库文件或目录，也不发起任何网络请求（数据库可读但不可写时同样可查询）。
+- `recent`：**只读**查询历史，按 `id` 倒序输出 JSON 数组；可选 `--url` 按数据库保存的原始 URL 字符串**精确匹配**筛选（不合并、不规范化路径或查询参数，校验规则与 `check` 相同），不新增表或记录、不创建数据库文件或目录，也不发起任何网络请求（数据库可读但不可写时同样可查询）。
 
 目标 URL 限制：仅 `http` 协议、主机必须为 `127.0.0.1`、必须显式指定 `1-65535` 端口；允许路径与查询参数；不接受用户信息（userinfo）与片段（fragment）；其余地址一律拒绝。本轮不做服务自动发现，也不含 TCP、定时任务或告警。
 
@@ -44,6 +44,12 @@ python3 healthcheck.py --db monitor.sqlite recent --limit 5
 
 # 关闭后重新启动查询进程，仍能从同一数据库读到这两条记录
 python3 healthcheck.py --db monitor.sqlite recent
+
+# 只看某个目标的记录：按入库时的原始 URL 字符串精确匹配，
+# detail=1 与 detail=2 互不命中
+python3 healthcheck.py --db monitor.sqlite recent \
+    --url 'http://127.0.0.1:8765/health?detail=1' --limit 2
+# [{"id":3,...},{"id":1,...}]
 ```
 
 路径与查询参数同样允许，例如：
