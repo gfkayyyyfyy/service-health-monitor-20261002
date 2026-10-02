@@ -91,11 +91,23 @@ def validate_target_url(raw_url):
     if any(ch.isspace() or ord(ch) < 32 for ch in raw_url):
         die(f"非法 URL（含空白或控制字符）: {raw_url!r}")
 
-    parsed = urlparse(raw_url)
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        # 结构非法（如未配对的方括号 "http://[127.0.0.1:8765/"）
+        die(f"非法 URL（结构无法解析）: {raw_url!r}")
+        return  # 仅为类型检查器所知，实际不可达
+
+    try:
+        hostname = parsed.hostname
+    except ValueError:
+        # 括号内不是合法地址（如 http://[]/、http://[zzz]/）
+        die(f"非法 URL（主机地址无法解析）: {raw_url!r}")
+        return  # 仅为类型检查器所知，实际不可达
 
     if parsed.scheme != "http":
         die(f"仅接受 http 协议: {raw_url!r}")
-    if parsed.hostname != ALLOWED_HOST:
+    if hostname != ALLOWED_HOST:
         die(f"仅接受主机 {ALLOWED_HOST}: {raw_url!r}")
     try:
         port = parsed.port
