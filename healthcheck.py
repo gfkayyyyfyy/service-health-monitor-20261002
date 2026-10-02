@@ -5,6 +5,7 @@
     python healthcheck.py --db monitor.sqlite check --url http://127.0.0.1:8765/
     python healthcheck.py --db monitor.sqlite recent --limit 5
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1
+    python healthcheck.py --db monitor.sqlite recent --summary --limit 2
 """
 
 import argparse
@@ -233,6 +234,32 @@ def command_check(args):
     return 0 if status == STATUS_SUCCESS else 1
 
 
+def print_summary(rows):
+    """为 recent 本来会返回的记录（同样的筛选、排序与 limit）输出耗时摘要。
+
+    成功与失败记录均参与，零耗时也计入；不补查当前服务状态。
+    无样本时三个耗时字段为 null。
+    """
+    elapsed_values = [row[3] for row in rows]
+    count = len(elapsed_values)
+    if count == 0:
+        summary = {
+            "count": 0,
+            "min_elapsed_ms": None,
+            "max_elapsed_ms": None,
+            "avg_elapsed_ms": None,
+        }
+    else:
+        summary = {
+            "count": count,
+            "min_elapsed_ms": min(elapsed_values),
+            "max_elapsed_ms": max(elapsed_values),
+            # 总和除以样本数，以 JSON 数字原样输出，不取整
+            "avg_elapsed_ms": sum(elapsed_values) / count,
+        }
+    print(json.dumps(summary, separators=(",", ":"), ensure_ascii=False))
+
+
 def command_recent(args):
     db_path = args.db
 
@@ -245,7 +272,10 @@ def command_recent(args):
     # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
     # 不创建文件、不创建目录、不发任何网络请求
     if not os.path.exists(db_path):
-        print("[]")
+        if args.summary:
+            print_summary([])
+        else:
+            print("[]")
         return 0
 
     # 路径指向目录不是有效的数据库文件
@@ -285,6 +315,10 @@ def command_recent(args):
     except sqlite3.Error as exc:
         # 文件不是有效 SQLite 数据库、checks 表缺少所需字段等
         die(f"读取数据库 {db_path!r} 失败: {exc}")
+
+    if args.summary:
+        print_summary(rows)
+        return 0
 
     records = [
         {
@@ -332,6 +366,13 @@ def build_parser():
         type=positive_limit,
         default=DEFAULT_LIMIT,
         help=f"返回条数，正整数（默认 {DEFAULT_LIMIT}）",
+    )
+    p_recent.add_argument(
+        "--summary",
+        action="store_true",
+        help="可选：不返回记录数组，只输出一行耗时摘要 JSON 对象"
+             "（count/min_elapsed_ms/max_elapsed_ms/avg_elapsed_ms），"
+             "统计范围与 recent 本来会返回的记录一致",
     )
     p_recent.set_defaults(handler=command_recent)
 
