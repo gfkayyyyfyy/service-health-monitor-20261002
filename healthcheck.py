@@ -11,6 +11,7 @@ import http.client
 import json
 import math
 import os
+import pathlib
 import sqlite3
 import sys
 import time
@@ -209,19 +210,42 @@ def command_check(args):
 
 def command_recent(args):
     db_path = args.db
-    # recent 只读历史：文件尚不存在时历史为空，不创建文件
+    # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
+    # 不创建文件、不创建目录、不发任何网络请求
     if not os.path.exists(db_path):
         print("[]")
         return 0
 
+    # 路径指向目录不是有效的数据库文件
+    if os.path.isdir(db_path):
+        die(f"读取数据库 {db_path!r} 失败: 路径是一个目录，不是 SQLite 数据库文件")
+
+    # 以只读模式打开：可读但不可写的文件也能查询，
+    # 且任何情况下都不会创建或修改文件（含 -wal/-journal）
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        die(f"读取数据库 {db_path!r} 失败: {exc}")
+
+    try:
         try:
-            conn.execute(CREATE_TABLE_SQL)
-            rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
+            # 只查询，绝不执行 CREATE TABLE / INSERT 等写操作
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "checks" not in tables:
+                # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
+                rows = []
+            else:
+                rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
+        # 文件不是有效 SQLite 数据库、checks 表缺少所需字段等
         die(f"读取数据库 {db_path!r} 失败: {exc}")
 
     records = [
