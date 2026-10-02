@@ -129,7 +129,10 @@ def validate_target_url(raw_url):
         die(f"端口必须在 1-65535 之间: {raw_url!r}")
     if parsed.username is not None or parsed.password is not None:
         die(f"不接受用户信息(userinfo): {raw_url!r}")
-    if parsed.fragment != "":
+    # 以原始字符串中的 “#” 分隔符为准：即使片段内容为空（URL 以 “#”
+    # 结尾或查询参数后直接跟 “#”），也一律拒绝；“%23” 是普通编码内容，
+    # 不包含字面 “#”，照常接受
+    if "#" in raw_url:
         die(f"不接受片段(fragment): {raw_url!r}")
 
     path = parsed.path or "/"
