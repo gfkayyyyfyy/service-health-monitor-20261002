@@ -5,6 +5,7 @@
     python healthcheck.py --db monitor.sqlite check --url http://127.0.0.1:8765/
     python healthcheck.py --db monitor.sqlite recent --limit 5
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1
+    python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --limit 2
 """
 
 import argparse
@@ -63,6 +64,12 @@ WHERE url = ?
 ORDER BY id DESC
 LIMIT ?
 """
+
+# 无记录时的摘要输出（count 为 0、耗时字段为 null）
+NULL_SUMMARY_JSON = (
+    '{"count":0,"min_elapsed_ms":null,'
+    '"max_elapsed_ms":null,"avg_elapsed_ms":null}'
+)
 
 
 def die(message):
@@ -245,7 +252,10 @@ def command_recent(args):
     # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
     # 不创建文件、不创建目录、不发任何网络请求
     if not os.path.exists(db_path):
-        print("[]")
+        if args.summary:
+            print(NULL_SUMMARY_JSON)
+        else:
+            print("[]")
         return 0
 
     # 路径指向目录不是有效的数据库文件
@@ -285,6 +295,31 @@ def command_recent(args):
     except sqlite3.Error as exc:
         # 文件不是有效 SQLite 数据库、checks 表缺少所需字段等
         die(f"读取数据库 {db_path!r} 失败: {exc}")
+
+    if args.summary:
+        # 摘要模式：对 recent 本会返回的同一批记录（同样的 URL 精确筛选、
+        # id 倒序、limit 截取）统计耗时，成功与失败记录、零耗时均计入。
+        elapsed_values = [row[3] for row in rows]
+        if elapsed_values:
+            count = len(elapsed_values)
+            summary = {
+                "count": count,
+                "min_elapsed_ms": min(elapsed_values),
+                "max_elapsed_ms": max(elapsed_values),
+                # 平均值不取整，以 JSON 数字原样输出
+                "avg_elapsed_ms": sum(elapsed_values) / count,
+            }
+        else:
+            # 无记录（含数据库不存在、无 checks 表、筛选无匹配）：
+            # count 为 0，耗时字段为 null，退出码仍为 0
+            summary = {
+                "count": 0,
+                "min_elapsed_ms": None,
+                "max_elapsed_ms": None,
+                "avg_elapsed_ms": None,
+            }
+        print(json.dumps(summary, separators=(",", ":"), ensure_ascii=False))
+        return 0
 
     records = [
         {
@@ -332,6 +367,12 @@ def build_parser():
         type=positive_limit,
         default=DEFAULT_LIMIT,
         help=f"返回条数，正整数（默认 {DEFAULT_LIMIT}）",
+    )
+    p_recent.add_argument(
+        "--summary",
+        action="store_true",
+        help="可选：不返回记录列表，改为输出这批记录的耗时摘要"
+             "（count/min/max/avg，单行 JSON 对象）",
     )
     p_recent.set_defaults(handler=command_recent)
 
