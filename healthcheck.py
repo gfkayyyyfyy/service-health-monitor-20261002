@@ -32,6 +32,11 @@ REASON_TIMEOUT = "timeout"
 STATUS_SUCCESS = "success"
 STATUS_FAILURE = "failure"
 
+# check 写入与 recent 读取共同依赖的 checks 表字段
+REQUIRED_COLUMNS = (
+    "id", "url", "checked_at", "elapsed_ms", "status", "http_status", "reason",
+)
+
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS checks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +157,27 @@ def validate_target_url(raw_url):
     return port, target
 
 
+def missing_required_columns(conn):
+    """既有 checks 表缺少的必需字段（按 REQUIRED_COLUMNS 顺序）。
+
+    表不存在时返回空元组（随后由 CREATE TABLE 建表）。
+    字段名比较沿用 SQLite 的大小写不敏感语义；列顺序不同或存在
+    额外列不算缺失。只核对字段名，不检查类型、索引与约束。
+    """
+    tables = {
+        row[0].lower()
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "checks" not in tables:
+        return ()
+    existing = {
+        row[1].lower() for row in conn.execute("PRAGMA table_info(checks)")
+    }
+    return tuple(col for col in REQUIRED_COLUMNS if col not in existing)
+
+
 def open_database(db_path):
     """打开（必要时创建）数据库并确保表存在；任何失败均以退出码 2 结束。"""
     parent = os.path.dirname(os.path.abspath(db_path))
@@ -159,6 +185,12 @@ def open_database(db_path):
         die(f"数据库父目录不存在: {parent}")
     try:
         conn = sqlite3.connect(db_path)
+        # 既有 checks 表缺字段时在探测前拒绝：不发请求、不新增记录、
+        # 不补列或重建表，原有表结构与数据保持不变
+        missing = missing_required_columns(conn)
+        if missing:
+            die(f"数据库 {db_path!r} 的 checks 表缺少必需字段: "
+                f"{', '.join(missing)}")
         conn.execute(CREATE_TABLE_SQL)
         conn.commit()
     except sqlite3.Error as exc:
