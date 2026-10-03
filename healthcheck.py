@@ -351,7 +351,7 @@ def command_recent(args):
         try:
             # 只查询，绝不执行 CREATE TABLE / INSERT 等写操作
             tables = {
-                row[0]
+                row[0].lower()
                 for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
@@ -359,30 +359,37 @@ def command_recent(args):
             if "checks" not in tables:
                 # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
                 rows = []
-            elif args.url is not None and status_filter is not None:
-                # 原始 url 字符串精确匹配 + status 等值匹配，两个条件同时满足；
-                # 先筛选再按 id 倒序限量
-                rows = conn.execute(
-                    SELECT_BY_URL_STATUS_SQL,
-                    (args.url, status_filter, args.limit),
-                ).fetchall()
-            elif status_filter is not None:
-                # 仅按记录的 status 筛选，不区分失败原因（reason）
-                rows = conn.execute(
-                    SELECT_BY_STATUS_SQL, (status_filter, args.limit)
-                ).fetchall()
-            elif args.url is not None:
-                # 按数据库中保存的原始 url 字符串精确匹配：
-                # 不合并路径或查询参数不同的地址，也不规范化 URL
-                rows = conn.execute(
-                    SELECT_BY_URL_SQL, (args.url, args.limit)
-                ).fetchall()
             else:
-                rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
+                # 表名比较沿用 SQLite 的大小写不敏感语义：名为 CHECKS/Checks
+                # 等的表与 checks 是同一张历史表，以下 SELECT 中的 checks
+                # 也按同样规则解析到该表。
+                # 该表缺任一所需字段时以退出码 2 拒绝（stderr 说明缺列），
+                # 不再误报为空历史。
+                ensure_checks_columns(conn)
+                if args.url is not None and status_filter is not None:
+                    # 原始 url 字符串精确匹配 + status 等值匹配，两个条件同时满足；
+                    # 先筛选再按 id 倒序限量
+                    rows = conn.execute(
+                        SELECT_BY_URL_STATUS_SQL,
+                        (args.url, status_filter, args.limit),
+                    ).fetchall()
+                elif status_filter is not None:
+                    # 仅按记录的 status 筛选，不区分失败原因（reason）
+                    rows = conn.execute(
+                        SELECT_BY_STATUS_SQL, (status_filter, args.limit)
+                    ).fetchall()
+                elif args.url is not None:
+                    # 按数据库中保存的原始 url 字符串精确匹配：
+                    # 不合并路径或查询参数不同的地址，也不规范化 URL
+                    rows = conn.execute(
+                        SELECT_BY_URL_SQL, (args.url, args.limit)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(SELECT_SQL, (args.limit,)).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
-        # 文件不是有效 SQLite 数据库、checks 表缺少所需字段等
+        # 文件不是有效 SQLite 数据库等查询期错误
         die(f"读取数据库 {db_path!r} 失败: {exc}")
 
     if args.summary:

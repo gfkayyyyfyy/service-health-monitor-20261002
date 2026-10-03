@@ -8,7 +8,7 @@ SQL 常量（行号以当前 `healthcheck.py` 为准）。
 `test_recent_status_filter.py`（5 条验收样本）实际运行核对，退出码、stdout、
 stderr 均与记录一致；现有测试套件（92 项）全部通过。
 
-- 入口函数：`main`（`healthcheck.py:481`）→ `command_recent`（`healthcheck.py:315-426`）
+- 入口函数：`main`（`healthcheck.py:488`）→ `command_recent`（`healthcheck.py:315-433`）
 - `recent` **不发送网络请求、不创建文件/目录/表、不改动已有记录**；数据库以只读
   URI 打开，可读但不可写的库仍可查询。
 
@@ -16,7 +16,7 @@ stderr 均与记录一致；现有测试套件（92 项）全部通过。
 
 ## 1. 公开参数
 
-命令形式（参数定义见 `build_parser` 中 recent 子解析器，`healthcheck.py:447-476`）：
+命令形式（参数定义见 `build_parser` 中 recent 子解析器，`healthcheck.py:454-483`）：
 
 ```sh
 python healthcheck.py --db <数据库路径> recent \
@@ -25,11 +25,11 @@ python healthcheck.py --db <数据库路径> recent \
 
 | 参数 | 是否必填 | 默认 | 约束与语义 | 代码位置 |
 |---|---|---|---|---|
-| `--db` | 必填（全局） | 无 | SQLite 数据库文件路径 | `healthcheck.py:434` |
-| `--url` | 可选 | `None` | 给出时只返回该目标的记录；省略时查询**全部目标** | `healthcheck.py:448-453` |
-| `--status` | 可选 | `None`（不筛选） | 给出时只返回该状态的记录；**只接受区分大小写的 `success` / `failure`**，省略时查询全部状态 | `healthcheck.py:454-463` |
+| `--db` | 必填（全局） | 无 | SQLite 数据库文件路径 | `healthcheck.py:441` |
+| `--url` | 可选 | `None` | 给出时只返回该目标的记录；省略时查询**全部目标** | `healthcheck.py:455-460` |
+| `--status` | 可选 | `None`（不筛选） | 给出时只返回该状态的记录；**只接受区分大小写的 `success` / `failure`**，省略时查询全部状态 | `healthcheck.py:461-470` |
 | `--limit` | 可选 | `5`（`DEFAULT_LIMIT`，`healthcheck.py:26`） | 正整数；`0`、负数、`1.5`、非数字均被拒绝 | `positive_limit`，`healthcheck.py:121-130` |
-| `--summary` | 可选开关 | 关 | 输出这批记录的耗时摘要，而非记录数组 | `healthcheck.py:470-475` |
+| `--summary` | 可选开关 | 关 | 输出这批记录的耗时摘要，而非记录数组 | `healthcheck.py:477-482` |
 
 ### 1.1 `--url` 的规则
 
@@ -51,7 +51,7 @@ python healthcheck.py --db <数据库路径> recent \
   `Success`、`FAILURE`、带前后空白（`" failure"`）等都不合法；
 - **空字符串**（`--status ""`）不合法；
 - **裸 `--status`（命令行上缺少值）** 不合法：argparse 以
-  `nargs="?", const=STATUS_FILTER_MISSING`（`healthcheck.py:456-458`）把该
+  `nargs="?", const=STATUS_FILTER_MISSING`（`healthcheck.py:463-465`）把该
   情形标记为哨兵 `STATUS_FILTER_MISSING`（`healthcheck.py:38`），再由校验函数
   识别并拒绝（与「完全省略 `--status`」的 `None` 严格区分）；
 - 以上非法情形一律经 `die`（`healthcheck.py:105-108`）输出 stderr 并以退出码
@@ -67,7 +67,7 @@ python healthcheck.py --db <数据库路径> recent \
 ## 2. 端到端流程
 
 `main` 解析参数后调用 `args.handler`，对 `recent` 即 `command_recent`
-（`healthcheck.py:315-426`）。步骤严格按以下顺序发生：
+（`healthcheck.py:315-433`）。步骤严格按以下顺序发生：
 
 1. **先校验 `--status`**（`healthcheck.py:318-321`）。
    提供了 `--status` 时先调用 `validate_status_filter`；非法值（含空字符串、
@@ -97,32 +97,39 @@ python healthcheck.py --db <数据库路径> recent \
    注意：`check` 使用的 `open_database`（`healthcheck.py:207-223`，会建库建表）
    **recent 从不调用**。
 
-6. **判断表是否存在并执行查询**（`healthcheck.py:351-381`）。
-   先查 `sqlite_master`：有效库中没有 `checks` 表（空库或仅有其他表）时，
-   `rows = []`，不报错、不建表。否则按两个可选筛选的组合四选一，均为
+6. **判断表是否存在并执行查询**（`healthcheck.py:351-388`）。
+   先查 `sqlite_master`：表名比较沿用 SQLite 的大小写不敏感语义
+   （对查到的表名取 `.lower()` 后比对，`healthcheck.py:353-358`），因此名为
+   `CHECKS` / `Checks` 等的表与 `checks` 是同一张历史表，后续 SELECT 中的
+   `checks` 也按同样规则解析到该表。有效库中没有 `checks` 表（空库或仅有
+   其他表）时，`rows = []`（`healthcheck.py:359-361`），不报错、不建表。
+   表存在时先经 `ensure_checks_columns`（`healthcheck.py:226-238`，调用点
+   `healthcheck.py:368`）核对七个所需字段：缺任意一个即经 `die` 以退出码
+   `2` 结束，stderr 说明缺失字段，**不会误报为空历史**；列顺序不同或存在
+   额外列不影响。字段齐全后按两个可选筛选的组合四选一，均为
    `ORDER BY id DESC LIMIT ?`，选择列顺序都是
    `id, url, checked_at, elapsed_ms, status, http_status, reason`：
 
    | `--url` | `--status` | 执行的 SQL | 绑定参数 | 代码位置 |
    |---|---|---|---|---|
-   | 省略 | 省略 | `SELECT_SQL`（`healthcheck.py:67-72`） | `(limit,)` | `381` |
-   | 给出 | 省略 | `SELECT_BY_URL_SQL`（`74-80`） | `(url, limit)` | `377-379` |
-   | 省略 | 给出 | `SELECT_BY_STATUS_SQL`（`82-88`） | `(status, limit)` | `369-373` |
-   | 给出 | 给出 | `SELECT_BY_URL_STATUS_SQL`（`90-96`） | `(url, status, limit)` | `362-368` |
+   | 省略 | 省略 | `SELECT_SQL`（`healthcheck.py:67-72`） | `(limit,)` | `388` |
+   | 给出 | 省略 | `SELECT_BY_URL_SQL`（`74-80`） | `(url, limit)` | `381-386` |
+   | 省略 | 给出 | `SELECT_BY_STATUS_SQL`（`82-88`） | `(status, limit)` | `376-380` |
+   | 给出 | 给出 | `SELECT_BY_URL_STATUS_SQL`（`90-96`） | `(url, status, limit)` | `369-375` |
 
    语义统一为**先用全部给定条件筛选（`url` 原始字符串精确匹配、`status` 等值
    匹配，条件之间是 AND），再按 id 倒序取前 `--limit` 条**：limit 永远作用在
    筛选之后，不会先截断再筛选。
 
-   查询期 sqlite 错误（文件不是有效 SQLite 库、`checks` 表缺少查询所需字段等）
-   由 `except sqlite3.Error` 捕获（`healthcheck.py:384-386`），经 `die` 以
+   查询期 sqlite 错误（文件不是有效 SQLite 库等）
+   由 `except sqlite3.Error` 捕获（`healthcheck.py:391-393`），经 `die` 以
    退出码 `2` 结束。
 
 7. **输出 JSON**（单行，紧凑分隔，`ensure_ascii=False`，末尾一个换行）：
-   - `--summary`：见第 5、7 节（`healthcheck.py:388-411`）；
+   - `--summary`：见第 5、7 节（`healthcheck.py:395-418`）；
    - 普通查询：把每行按七字段映射为记录对象数组
-     （`healthcheck.py:413-424`），`json.dumps(..., separators=(",", ":"))`
-     输出（`healthcheck.py:425`）。无记录时输出 `[]`。
+     （`healthcheck.py:420-431`），`json.dumps(..., separators=(",", ":"))`
+     输出（`healthcheck.py:432`）。无记录时输出 `[]`。
 
 两种成功形态退出码均为 `0`，stderr 为空。
 
@@ -195,7 +202,7 @@ python healthcheck.py --db monitor.sqlite recent \
 {"count":3,"min_elapsed_ms":0,"max_elapsed_ms":7,"avg_elapsed_ms":3.0}
 ```
 
-**摘要统计口径确认**（实现：`healthcheck.py:388-411`）：摘要统计的就是
+**摘要统计口径确认**（实现：`healthcheck.py:395-418`）：摘要统计的就是
 **同条件 `recent`（不带 `--summary`）会返回的同一记录子集**——同样的筛选
 条件、同样按 id 倒序、同样的 limit 截取；代码对这批 `rows` 直接取
 `row[3]`（即 `elapsed_ms`）计算，并不另外发起任何查询。因此它：
@@ -205,12 +212,12 @@ python healthcheck.py --db monitor.sqlite recent \
 - **不是仅成功记录**：id 6（failure，7 ms）与 id 3（failure，0 ms）都计入；
 - **零耗时参与统计**：`min_elapsed_ms` 为 0（id 3），count 仍为 3；
 - **平均值不取整**：`(7 + 2 + 0) / 3 = 3.0`，以 JSON 数字原样输出
-  （`sum(...) / count` 的浮点除法，`healthcheck.py:399`），故序列化为 `3.0`
+  （`sum(...) / count` 的浮点除法，`healthcheck.py:406`），故序列化为 `3.0`
   而非 `3`；max 为 7（id 6）。
 
 无记录时（缺库、无 `checks` 表、空表、筛选无匹配），摘要为
 `count: 0` 且三个耗时字段为 `null`：缺库快路径输出常量 `NULL_SUMMARY_JSON`
-（`healthcheck.py:99-102`），其余路径构造等价对象（`healthcheck.py:401-409`）。
+（`healthcheck.py:99-102`），其余路径构造等价对象（`healthcheck.py:408-416`）。
 
 ---
 
@@ -250,7 +257,7 @@ python healthcheck.py --db monitor.sqlite recent \
 
 - 命中条件是 **url 等于 A 且 status 等于 failure**：
   `WHERE url = ? AND status = ?`（`SELECT_BY_URL_STATUS_SQL`，
-  `healthcheck.py:90-96`，执行点 `362-368`）；
+  `healthcheck.py:90-96`，执行点 `369-375`）；
 - A 的 failure 只有 id 1、4，倒序取前 2 得 **4、1**；
   A 的两条 success（id 2、5）被 status 条件排除；
   B 的 id 3 虽是 failure，但 url 不同，被 url 条件排除；
@@ -274,7 +281,7 @@ id 1 的零耗时参与统计（min 为 0，count 仍为 2）；均值 `(3 + 0) 
 
 补充：只给 `--status failure`（省略 `--url`，默认 limit 5）时跨全部目标命中
 id 4、3、1（B 的 id 3 也在内），对应 `SELECT_BY_STATUS_SQL`
-（`healthcheck.py:82-88`，执行点 `369-373`）；`--status success` 则命中
+（`healthcheck.py:82-88`，执行点 `376-380`）；`--status success` 则命中
 id 5、2。
 
 ---
@@ -288,8 +295,8 @@ id 5、2。
 | 情形 | 普通查询 stdout | 摘要 stdout | 代码位置 |
 |---|---|---|---|
 | 数据库文件不存在（父目录也不存在） | `[]` | `{"count":0,"min_elapsed_ms":null,"max_elapsed_ms":null,"avg_elapsed_ms":null}` | `healthcheck.py:331-336` |
-| 有效数据库但没有 `checks` 表（含仅有其他表） | `[]` | 同上（count 0、三个 null） | `359-361` + `401-409` |
-| `checks` 表存在但为空表 | `[]` | 同上 | 查询返回 0 行，`388-409` |
+| 有效数据库但没有 `checks` 表（含仅有其他表） | `[]` | 同上（count 0、三个 null） | `359-361` + `408-416` |
+| `checks` 表存在但为空表 | `[]` | 同上 | 查询返回 0 行，`395-416` |
 | 合法条件但无匹配记录（URL/status 任一组合无命中） | `[]` | 同上 | 对应 SELECT 返回 0 行 |
 
 这些情形 stderr 均为空，且不创建文件/目录、不补建 `checks` 表，其他表与数据
@@ -300,13 +307,13 @@ id 5、2。
 | 情形 | 报告位置 / 实测信息要点 |
 |---|---|
 | 非法 `--status`（非 `success`/`failure`、大小写不符、空字符串、带空白） | `validate_status_filter` → `die`，前缀 `healthcheck: error:`，信息含「status 参数错误」并回显实际值（`healthcheck.py:132-152, 318-321`） |
-| 裸 `--status` 缺少值 | 哨兵 `STATUS_FILTER_MISSING` 被同一校验拒绝，信息说明「--status 必须提供值」（`healthcheck.py:142-146, 456-458`） |
+| 裸 `--status` 缺少值 | 哨兵 `STATUS_FILTER_MISSING` 被同一校验拒绝，信息说明「--status 必须提供值」（`healthcheck.py:142-146, 463-465`） |
 | 非法 `--url`（非 http、非 127.0.0.1、缺端口、端口越界、userinfo、含 `#`、空白或结构非法等） | `validate_target_url` → `die`，前缀 `healthcheck: error:`，并回显非法输入（`healthcheck.py:154-204, 323-327`） |
 | 非法 `--limit`（0、负数、`1.5`、非数字） | argparse 在进入 `command_recent` **之前**拒绝，退出码 2、stdout 空、用法与原因写 stderr（`positive_limit`，`healthcheck.py:121-130`） |
 | `--db` 路径是目录 | `healthcheck.py:339-340`，信息含「目录」 |
-| 文件存在但不是有效 SQLite 数据库 | 查询期错误，实测为 `file is not a database`（`healthcheck.py:384-386`） |
-| 读取权限不足 | 只读打开/查询失败，实测为 `unable to open database file`（`healthcheck.py:344-348, 384-386`） |
-| `checks` 表缺少查询所需字段 | 查询期错误，实测为 `no such column: checked_at`（`healthcheck.py:384-386`） |
+| 文件存在但不是有效 SQLite 数据库 | 查询期错误，实测为 `file is not a database`（`healthcheck.py:391-393`） |
+| 读取权限不足 | 只读打开/查询失败，实测为 `unable to open database file`（`healthcheck.py:344-348, 391-393`） |
+| `checks` 表（含 `CHECKS`/`Checks` 等大小写变体）缺少所需字段 | `ensure_checks_columns` → `die`，信息含「checks 表缺少字段」并列出缺失字段名（`healthcheck.py:226-238`，调用点 `368`）；不再返回空历史 |
 
 优先级：argparse 先解析 `--limit`，故 limit 非法时根本不会进入处理函数；
 进入 `command_recent` 后**先校验 status、再校验 URL、最后判断数据库路径**，
@@ -327,7 +334,8 @@ id 5、2。
   `test_recent_status_filter.py` 另外用刻意不存在的数据库路径核对：非法
   `--status` 被拒绝时也不会落库或建目录。
 - **不创建表、不改动记录**：库以 `?mode=ro` 打开（`healthcheck.py:344`），
-  全程只有 `SELECT`（含对 `sqlite_master` 的查询）；无 `checks` 表时仅置空结果。
+  全程只有 `SELECT` 与只读的 `PRAGMA table_info`（含对 `sqlite_master` 的查询）；
+  无 `checks` 表时仅置空结果。
   测试通过前后目录文件集合与全表内容快照比对确认无变化。
 - **可读但不可写的数据库仍可查询**：只读 URI 不需要写权限，也不生成
   `-wal`/`-journal` 旁路文件（`test_readonly_database_is_queryable` 覆盖了
@@ -351,20 +359,21 @@ id 5、2。
 
 | 结论 | 函数 / 常量 | 位置 |
 |---|---|---|
-| recent 处理总流程 | `command_recent` | `healthcheck.py:315-426` |
+| recent 处理总流程 | `command_recent` | `healthcheck.py:315-433` |
 | status 必须为区分大小写的 success/failure，且最先校验 | `validate_status_filter` / 哨兵 `STATUS_FILTER_MISSING` | `132-152` / `38`，调用点 `318-321` |
 | URL 合法性规则（先于 DB 路径、晚于 status 执行） | `validate_target_url` | `154-204`，调用点 `323-327` |
 | limit 必须为正整数、默认 5 | `positive_limit` / `DEFAULT_LIMIT` | `121-130` / `26` |
 | 缺库（含父目录缺失）视为空，不创建 | 路径存在性分支 | `331-336` |
 | 目录路径报错（退出码 2） | 目录分支 + `die` | `339-340` |
 | 只读打开、不可写也能查 | `?mode=ro` URI | `344-348` |
-| 无 `checks` 表视为空、不建表 | `sqlite_master` 判断 | `353-361` |
-| 无条件：按 id 倒序限量 | `SELECT_SQL` | `67-72`，执行点 `381` |
-| 仅 URL：原始字符串精确匹配 | `SELECT_BY_URL_SQL` | `74-80`，执行点 `377-379` |
-| 仅 status：按记录 status 等值匹配（不看 reason） | `SELECT_BY_STATUS_SQL` | `82-88`，执行点 `369-373` |
-| URL + status：两条件 AND，先筛选后限量 | `SELECT_BY_URL_STATUS_SQL` | `90-96`，执行点 `362-368` |
-| 摘要统计同条件记录子集；失败与零耗时计入；均值不取整 | 摘要分支 | `388-411` |
+| 无 `checks` 表视为空、不建表；表名大小写不敏感识别 | `sqlite_master` 判断（表名取 `.lower()` 比对） | `353-361` |
+| 历史表（含 `CHECKS`/`Checks` 变体）缺列即退出码 2 | `ensure_checks_columns` | `226-238`，调用点 `368` |
+| 无条件：按 id 倒序限量 | `SELECT_SQL` | `67-72`，执行点 `388` |
+| 仅 URL：原始字符串精确匹配 | `SELECT_BY_URL_SQL` | `74-80`，执行点 `381-386` |
+| 仅 status：按记录 status 等值匹配（不看 reason） | `SELECT_BY_STATUS_SQL` | `82-88`，执行点 `376-380` |
+| URL + status：两条件 AND，先筛选后限量 | `SELECT_BY_URL_STATUS_SQL` | `90-96`，执行点 `369-375` |
+| 摘要统计同条件记录子集；失败与零耗时计入；均值不取整 | 摘要分支 | `395-418` |
 | 空摘要固定输出（count 0、三个 null） | `NULL_SUMMARY_JSON` | `99-102` |
-| 完整七字段记录数组 / `[]` 输出 | 记录映射与 JSON 输出 | `413-425` |
+| 完整七字段记录数组 / `[]` 输出 | 记录映射与 JSON 输出 | `420-432` |
 | 错误统一出口（退出码 2、stderr、stdout 空） | `die` | `105-108` |
 | 网络探测与建库/写入仅属于 check（recent 不触碰） | `probe_once` / `open_database` / `INSERT_SQL` | `241-264` / `207-223` / `56-59` |
