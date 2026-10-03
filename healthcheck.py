@@ -50,6 +50,12 @@ INSERT INTO checks (url, checked_at, elapsed_ms, status, http_status, reason)
 VALUES (?, ?, ?, ?, ?, ?)
 """
 
+# 落库一条记录所依赖的全部字段；既有 checks 表缺其中任意一个时，
+# 必须在发送探测请求前拒绝（不补列、不重建表）
+REQUIRED_COLUMNS = (
+    "id", "url", "checked_at", "elapsed_ms", "status", "http_status", "reason",
+)
+
 SELECT_SQL = """
 SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
 FROM checks
@@ -153,7 +159,11 @@ def validate_target_url(raw_url):
 
 
 def open_database(db_path):
-    """打开（必要时创建）数据库并确保表存在；任何失败均以退出码 2 结束。"""
+    """打开（必要时创建）数据库并确保表存在；任何失败均以退出码 2 结束。
+
+    若 checks 表已存在但缺少落库所需字段，同样以退出码 2 结束：此检查发生
+    在任何网络探测之前，且不补列、不重建表，原有表结构与数据保持不变。
+    """
     parent = os.path.dirname(os.path.abspath(db_path))
     if not os.path.isdir(parent):
         die(f"数据库父目录不存在: {parent}")
@@ -161,9 +171,25 @@ def open_database(db_path):
         conn = sqlite3.connect(db_path)
         conn.execute(CREATE_TABLE_SQL)
         conn.commit()
+        ensure_checks_columns(conn)
     except sqlite3.Error as exc:
         die(f"无法打开或初始化数据库 {db_path!r}: {exc}")
     return conn
+
+
+def ensure_checks_columns(conn):
+    """核对既有 checks 表具备全部所需字段，缺任意一个即以退出码 2 拒绝。
+
+    字段名比较沿用 SQLite 的大小写不敏感语义；列顺序不同或存在额外列均
+    不构成问题。只检查字段是否存在，不涉及类型、索引与约束。
+    """
+    actual = {
+        row[1].lower()
+        for row in conn.execute("PRAGMA table_info(checks)")
+    }
+    missing = [name for name in REQUIRED_COLUMNS if name.lower() not in actual]
+    if missing:
+        die("checks 表缺少字段: " + ", ".join(missing))
 
 
 def probe_once(port, target, timeout):
