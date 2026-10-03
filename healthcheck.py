@@ -5,6 +5,7 @@
     python healthcheck.py --db monitor.sqlite check --url http://127.0.0.1:8765/
     python healthcheck.py --db monitor.sqlite recent --limit 5
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1
+    python healthcheck.py --db monitor.sqlite recent --status failure --limit 5
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --limit 2
 """
 
@@ -67,6 +68,22 @@ SELECT_BY_URL_SQL = """
 SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
 FROM checks
 WHERE url = ?
+ORDER BY id DESC
+LIMIT ?
+"""
+
+SELECT_BY_STATUS_SQL = """
+SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
+FROM checks
+WHERE status = ?
+ORDER BY id DESC
+LIMIT ?
+"""
+
+SELECT_BY_URL_AND_STATUS_SQL = """
+SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
+FROM checks
+WHERE url = ? AND status = ?
 ORDER BY id DESC
 LIMIT ?
 """
@@ -269,7 +286,17 @@ def command_check(args):
 def command_recent(args):
     db_path = args.db
 
-    # 先校验筛选 URL（沿用 check 的本机 URL 规则）：
+    # 先校验状态筛选：仅接受区分大小写的 success / failure；
+    # 其他值（含空字符串）在读数据库之前拒绝。
+    if args.status is not None and args.status not in (
+        STATUS_SUCCESS, STATUS_FAILURE
+    ):
+        die(
+            f"status 参数错误: 仅接受 {STATUS_SUCCESS!r} 或 "
+            f"{STATUS_FAILURE!r}（区分大小写），实际为 {args.status!r}"
+        )
+
+    # 再校验筛选 URL（沿用 check 的本机 URL 规则）：
     # 非法值即使数据库路径不存在或为目录，也优先报 URL 错误。
     # 仅做校验，匹配时仍使用原始字符串，不做任何规范化。
     if args.url is not None:
@@ -308,6 +335,18 @@ def command_recent(args):
             if "checks" not in tables:
                 # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
                 rows = []
+            elif args.url is not None and args.status is not None:
+                # URL 与状态两个条件同时满足：URL 按原始字符串精确匹配，
+                # 状态按记录的 status 列匹配（不区分失败原因），
+                # 先筛选再按 id 倒序限量
+                rows = conn.execute(
+                    SELECT_BY_URL_AND_STATUS_SQL,
+                    (args.url, args.status, args.limit),
+                ).fetchall()
+            elif args.status is not None:
+                rows = conn.execute(
+                    SELECT_BY_STATUS_SQL, (args.status, args.limit)
+                ).fetchall()
             elif args.url is not None:
                 # 按数据库中保存的原始 url 字符串精确匹配：
                 # 不合并路径或查询参数不同的地址，也不规范化 URL
@@ -387,6 +426,13 @@ def build_parser():
         default=None,
         help="可选：仅返回该目标的记录，按数据库保存的原始 url 字符串精确匹配"
              "（规则同 check：仅 http://127.0.0.1:端口/...）",
+    )
+    p_recent.add_argument(
+        "--status",
+        default=None,
+        help="可选：仅返回该状态的记录，只接受区分大小写的 'success' 或 "
+             "'failure'；省略时查询全部状态（按记录的 status 列筛选，"
+             "不区分失败原因）",
     )
     p_recent.add_argument(
         "--limit",
