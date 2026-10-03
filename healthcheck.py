@@ -5,7 +5,8 @@
     python healthcheck.py --db monitor.sqlite check --url http://127.0.0.1:8765/
     python healthcheck.py --db monitor.sqlite recent --limit 5
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1
-    python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --limit 2
+    python healthcheck.py --db monitor.sqlite recent --status failure --limit 5
+    python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status success --limit 2
 """
 
 import argparse
@@ -31,6 +32,13 @@ REASON_TIMEOUT = "timeout"
 
 STATUS_SUCCESS = "success"
 STATUS_FAILURE = "failure"
+
+# 裸 --status（命令行上未给值）时 argparse 注入的哨兵；
+# 区别于「完全省略该参数」的 None（None 表示不按状态筛选）
+STATUS_FILTER_MISSING = object()
+
+# --status 唯一合法的两个取值（区分大小写）
+STATUS_FILTER_CHOICES = (STATUS_SUCCESS, STATUS_FAILURE)
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS checks (
@@ -71,6 +79,22 @@ ORDER BY id DESC
 LIMIT ?
 """
 
+SELECT_BY_STATUS_SQL = """
+SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
+FROM checks
+WHERE status = ?
+ORDER BY id DESC
+LIMIT ?
+"""
+
+SELECT_BY_URL_STATUS_SQL = """
+SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
+FROM checks
+WHERE url = ? AND status = ?
+ORDER BY id DESC
+LIMIT ?
+"""
+
 # 无记录时的摘要输出（count 为 0、耗时字段为 null）
 NULL_SUMMARY_JSON = (
     '{"count":0,"min_elapsed_ms":null,'
@@ -103,6 +127,28 @@ def positive_limit(value):
     if str(limit) != str(value).strip() or limit <= 0:
         raise argparse.ArgumentTypeError(f"limit 必须是正整数: {value!r}")
     return limit
+
+
+def validate_status_filter(value):
+    """--status 只接受区分大小写的 success / failure；None 表示不筛选。
+
+    其他一切取值（空字符串、大小写变体、带空白，以及裸 --status 缺少值）
+    均经 die 以退出码 2 拒绝。此检查先于 URL 校验与一切数据库访问，
+    拒绝时不会读取数据库。
+    """
+    if value is None:
+        return None
+    if value is STATUS_FILTER_MISSING:
+        die(
+            "status 参数错误：--status 必须提供值 "
+            "'success' 或 'failure'（区分大小写），实际缺少值"
+        )
+    if value in STATUS_FILTER_CHOICES:
+        return value
+    die(
+        "status 参数错误：仅接受区分大小写的 'success' 或 'failure'"
+        f"（省略时查询全部状态），实际值 {value!r}"
+    )
 
 
 def validate_target_url(raw_url):
@@ -269,7 +315,12 @@ def command_check(args):
 def command_recent(args):
     db_path = args.db
 
-    # 先校验筛选 URL（沿用 check 的本机 URL 规则）：
+    # 先校验 --status（区分大小写，仅 success/failure）：
+    # 非法值（含空字符串、裸 --status 缺值）在读取数据库前即以退出码 2 拒绝。
+    # status 合法后，其余参数与数据库错误的报告顺序与原先一致（先 URL 后路径）。
+    status_filter = validate_status_filter(args.status)
+
+    # 再校验筛选 URL（沿用 check 的本机 URL 规则）：
     # 非法值即使数据库路径不存在或为目录，也优先报 URL 错误。
     # 仅做校验，匹配时仍使用原始字符串，不做任何规范化。
     if args.url is not None:
@@ -308,6 +359,18 @@ def command_recent(args):
             if "checks" not in tables:
                 # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
                 rows = []
+            elif args.url is not None and status_filter is not None:
+                # 原始 url 字符串精确匹配 + status 等值匹配，两个条件同时满足；
+                # 先筛选再按 id 倒序限量
+                rows = conn.execute(
+                    SELECT_BY_URL_STATUS_SQL,
+                    (args.url, status_filter, args.limit),
+                ).fetchall()
+            elif status_filter is not None:
+                # 仅按记录的 status 筛选，不区分失败原因（reason）
+                rows = conn.execute(
+                    SELECT_BY_STATUS_SQL, (status_filter, args.limit)
+                ).fetchall()
             elif args.url is not None:
                 # 按数据库中保存的原始 url 字符串精确匹配：
                 # 不合并路径或查询参数不同的地址，也不规范化 URL
@@ -387,6 +450,16 @@ def build_parser():
         default=None,
         help="可选：仅返回该目标的记录，按数据库保存的原始 url 字符串精确匹配"
              "（规则同 check：仅 http://127.0.0.1:端口/...）",
+    )
+    p_recent.add_argument(
+        "--status",
+        nargs="?",
+        const=STATUS_FILTER_MISSING,
+        default=None,
+        metavar="{success,failure}",
+        help="可选：仅返回该状态的记录，只接受区分大小写的 success 或 failure；"
+             "省略时查询全部状态。与 --url 同用时两个条件都要满足。"
+             "裸 --status（缺少值）或其他值均为参数错误",
     )
     p_recent.add_argument(
         "--limit",
