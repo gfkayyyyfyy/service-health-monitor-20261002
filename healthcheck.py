@@ -297,6 +297,20 @@ def filter_rows_by_since(rows, since, limit):
     return kept[:limit]
 
 
+def encode_request_target(target):
+    """将请求目标中的非 ASCII 字符按 UTF-8 字节转为大写十六进制百分号编码。
+
+    只处理非 ASCII 字符，ASCII 一律原样保留：已有的百分号编码（含字母
+    大小写，如 %23 不会变成 %2523）、查询中的加号、路径分隔符与参数顺序
+    都不受影响，混合中文与编码内容也不会被二次编码。
+    """
+    return "".join(
+        ch if ord(ch) < 128
+        else "".join(f"%{byte:02X}" for byte in ch.encode("utf-8"))
+        for ch in target
+    )
+
+
 def validate_target_url(raw_url):
     """只接受 http://127.0.0.1:<显式端口>[/path][?query]，拒绝其余一切。"""
     if not isinstance(raw_url, str) or not raw_url:
@@ -347,7 +361,9 @@ def validate_target_url(raw_url):
         target += ";" + parsed.params
     if parsed.query != "":
         target += "?" + parsed.query
-    return port, target
+    # 仅对发送用的请求目标做非 ASCII 百分号编码；原始 URL 不改动，
+    # 仍作为输出与历史记录的标识
+    return port, encode_request_target(target)
 
 
 def open_database(db_path):
