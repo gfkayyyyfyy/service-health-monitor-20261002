@@ -11,6 +11,7 @@
     python healthcheck.py --db monitor.sqlite recent --until 2026-10-04T00:00:02Z --limit 2
     python healthcheck.py --db monitor.sqlite recent --since 2026-10-04T00:00:01Z --until 2026-10-04T00:00:02.000000+00:00 --limit 2
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status failure --reason timeout --limit 2
+    python healthcheck.py --db monitor.sqlite recent --status-summary --limit 2
 """
 
 import argparse
@@ -129,6 +130,11 @@ RECENT_FILTER_CLAUSES = (
 NULL_SUMMARY_JSON = (
     '{"count":0,"min_elapsed_ms":null,'
     '"max_elapsed_ms":null,"avg_elapsed_ms":null}'
+)
+
+# 无记录时的状态摘要输出（三个计数均为 0）
+NULL_STATUS_SUMMARY_JSON = (
+    '{"count":0,"success_count":0,"failure_count":0}'
 )
 
 
@@ -546,6 +552,14 @@ def build_recent_query(quoted_table, filters, sql_limit=True):
 def command_recent(args):
     db_path = args.db
 
+    # 两个摘要选项互斥：同用时在任何参数校验与数据库访问之前
+    # 即以退出码 2 拒绝（stdout 为空，stderr 指出互斥）
+    if args.summary and args.status_summary:
+        die(
+            "参数错误：--summary 与 --status-summary 互斥，"
+            "一次查询只能选用其中一种摘要"
+        )
+
     # 先校验 --status（区分大小写，仅 success/failure）：
     # 非法值（含空字符串、裸 --status 缺值）在读取数据库前即以退出码 2 拒绝。
     # status 合法后，其余参数与数据库错误的报告顺序与原先一致（先 URL 后路径）。
@@ -589,6 +603,8 @@ def command_recent(args):
     if not os.path.exists(db_path):
         if args.summary:
             print(NULL_SUMMARY_JSON)
+        elif args.status_summary:
+            print(NULL_STATUS_SUMMARY_JSON)
         else:
             print("[]")
         return 0
@@ -679,6 +695,29 @@ def command_recent(args):
                 "avg_elapsed_ms": None,
             }
         print(json.dumps(summary, separators=(",", ":"), ensure_ascii=False))
+        return 0
+
+    if args.status_summary:
+        # 状态摘要模式：对 recent 本会返回的同一批记录（同样的筛选、
+        # id 倒序、limit 截取）按保存的 status 字段计数；只依据 status，
+        # 绝不从 reason 或 http_status 推断，零耗时与各种失败原因的记录
+        # 均参与计数。无记录（含数据库不存在、无 checks 表、筛选无匹配）
+        # 时三个计数均为 0，退出码仍为 0
+        success_count = sum(
+            1 for row in rows if row[4] == STATUS_SUCCESS
+        )
+        failure_count = sum(
+            1 for row in rows if row[4] == STATUS_FAILURE
+        )
+        status_summary = {
+            "count": len(rows),
+            "success_count": success_count,
+            "failure_count": failure_count,
+        }
+        print(
+            json.dumps(status_summary, separators=(",", ":"),
+                       ensure_ascii=False)
+        )
         return 0
 
     records = [
@@ -778,6 +817,13 @@ def build_parser():
         action="store_true",
         help="可选：不返回记录列表，改为输出这批记录的耗时摘要"
              "（count/min/max/avg，单行 JSON 对象）",
+    )
+    p_recent.add_argument(
+        "--status-summary",
+        action="store_true",
+        help="可选：不返回记录列表，改为输出这批记录的状态计数摘要"
+             "（count/success_count/failure_count，单行 JSON 对象，"
+             "只依据保存的 status 字段分类）。与 --summary 互斥",
     )
     p_recent.set_defaults(handler=command_recent)
 
