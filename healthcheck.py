@@ -6,6 +6,7 @@
     python healthcheck.py --db monitor.sqlite recent --limit 5
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1
     python healthcheck.py --db monitor.sqlite recent --status failure --limit 5
+    python healthcheck.py --db monitor.sqlite recent --reason timeout --limit 5
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status success --limit 2
 """
 
@@ -40,6 +41,18 @@ STATUS_FILTER_MISSING = object()
 # --status 唯一合法的两个取值（区分大小写）
 STATUS_FILTER_CHOICES = (STATUS_SUCCESS, STATUS_FAILURE)
 
+# 裸 --reason（命令行上未给值）时 argparse 注入的哨兵；
+# 区别于「完全省略该参数」的 None（None 表示不按原因筛选）
+REASON_FILTER_MISSING = object()
+
+# --reason 唯一合法的四个取值（区分大小写），与落库的 reason 取值一致
+REASON_FILTER_CHOICES = (
+    REASON_OK,
+    REASON_HTTP_STATUS,
+    REASON_CONNECTION_ERROR,
+    REASON_TIMEOUT,
+)
+
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS checks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,35 +77,13 @@ REQUIRED_COLUMNS = (
     "id", "url", "checked_at", "elapsed_ms", "status", "http_status", "reason",
 )
 
-# 四条查询的 {table} 在执行时替换为库中历史表的实际表名（加引号），
-# 以兼容 CHECKS / Checks 等仅大小写不同的历史表名
+# 查询的 {table} 在执行时替换为库中历史表的实际表名（加引号），
+# 以兼容 CHECKS / Checks 等仅大小写不同的历史表名；
+# {where} 按 --url / --status / --reason 的组合拼为 WHERE 子句或空串
 SELECT_SQL = """
 SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
 FROM {table}
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_URL_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE url = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_STATUS_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE status = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_URL_STATUS_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE url = ? AND status = ?
+{where}
 ORDER BY id DESC
 LIMIT ?
 """
@@ -150,6 +141,29 @@ def validate_status_filter(value):
     die(
         "status 参数错误：仅接受区分大小写的 'success' 或 'failure'"
         f"（省略时查询全部状态），实际值 {value!r}"
+    )
+
+
+def validate_reason_filter(value):
+    """--reason 只接受区分大小写的 ok/http_status/connection_error/timeout。
+
+    按数据库中保存的 reason 精确匹配，不从状态码推断；None 表示不筛选。
+    其他一切取值（空字符串、大小写变体、带空白，以及裸 --reason 缺少值）
+    均经 die 以退出码 2 拒绝。此检查在 status 与 URL 校验之后、
+    一切数据库访问之前进行，拒绝时不会读取数据库。
+    """
+    if value is None:
+        return None
+    if value is REASON_FILTER_MISSING:
+        die(
+            "reason 参数错误：--reason 必须提供值 'ok'、'http_status'、"
+            "'connection_error' 或 'timeout'（区分大小写），实际缺少值"
+        )
+    if value in REASON_FILTER_CHOICES:
+        return value
+    die(
+        "reason 参数错误：仅接受区分大小写的 'ok'、'http_status'、"
+        f"'connection_error' 或 'timeout'（省略时查询全部原因），实际值 {value!r}"
     )
 
 
@@ -328,6 +342,11 @@ def command_recent(args):
     if args.url is not None:
         validate_target_url(args.url)
 
+    # 最后校验 --reason（区分大小写，仅 ok/http_status/connection_error/timeout）：
+    # 保持原有校验顺序，status 与 URL 合法后才报告 reason 错误；
+    # 非法值（含空字符串、裸 --reason 缺值）同样在读取数据库前即以退出码 2 拒绝。
+    reason_filter = validate_reason_filter(args.reason)
+
     # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
     # 不创建文件、不创建目录、不发任何网络请求
     if not os.path.exists(db_path):
@@ -372,30 +391,27 @@ def command_recent(args):
                 # 不再误判为空历史
                 ensure_checks_columns(conn)
                 quoted = '"' + checks_table.replace('"', '""') + '"'
-                if args.url is not None and status_filter is not None:
-                    # 原始 url 字符串精确匹配 + status 等值匹配，两个条件同时满足；
-                    # 先筛选再按 id 倒序限量
-                    rows = conn.execute(
-                        SELECT_BY_URL_STATUS_SQL.format(table=quoted),
-                        (args.url, status_filter, args.limit),
-                    ).fetchall()
-                elif status_filter is not None:
-                    # 仅按记录的 status 筛选，不区分失败原因（reason）
-                    rows = conn.execute(
-                        SELECT_BY_STATUS_SQL.format(table=quoted),
-                        (status_filter, args.limit),
-                    ).fetchall()
-                elif args.url is not None:
-                    # 按数据库中保存的原始 url 字符串精确匹配：
-                    # 不合并路径或查询参数不同的地址，也不规范化 URL
-                    rows = conn.execute(
-                        SELECT_BY_URL_SQL.format(table=quoted),
-                        (args.url, args.limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        SELECT_SQL.format(table=quoted), (args.limit,)
-                    ).fetchall()
+                # --url / --status / --reason 同用时取交集：先按全部给定条件
+                # 筛选历史，再按 id 倒序取 --limit 条。url 用原始字符串精确匹配，
+                # reason 按保存值精确匹配（不从状态码推断），均不做任何规范化。
+                conditions = []
+                params = []
+                if args.url is not None:
+                    conditions.append("url = ?")
+                    params.append(args.url)
+                if status_filter is not None:
+                    conditions.append("status = ?")
+                    params.append(status_filter)
+                if reason_filter is not None:
+                    conditions.append("reason = ?")
+                    params.append(reason_filter)
+                where = ""
+                if conditions:
+                    where = "WHERE " + " AND ".join(conditions)
+                rows = conn.execute(
+                    SELECT_SQL.format(table=quoted, where=where),
+                    (*params, args.limit),
+                ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -404,8 +420,8 @@ def command_recent(args):
         die(f"读取数据库 {db_path!r} 失败: {exc}")
 
     if args.summary:
-        # 摘要模式：对 recent 本会返回的同一批记录（同样的 URL 精确筛选、
-        # id 倒序、limit 截取）统计耗时，成功与失败记录、零耗时均计入。
+        # 摘要模式：对 recent 本会返回的同一批记录（同样的 URL/status/reason
+        # 筛选、id 倒序、limit 截取）统计耗时，成功与失败记录、零耗时均计入。
         elapsed_values = [row[3] for row in rows]
         if elapsed_values:
             count = len(elapsed_values)
@@ -478,6 +494,17 @@ def build_parser():
         help="可选：仅返回该状态的记录，只接受区分大小写的 success 或 failure；"
              "省略时查询全部状态。与 --url 同用时两个条件都要满足。"
              "裸 --status（缺少值）或其他值均为参数错误",
+    )
+    p_recent.add_argument(
+        "--reason",
+        nargs="?",
+        const=REASON_FILTER_MISSING,
+        default=None,
+        metavar="{ok,http_status,connection_error,timeout}",
+        help="可选：仅返回该原因的记录，按保存的 reason 精确匹配（不从状态码推断），"
+             "只接受区分大小写的 ok、http_status、connection_error 或 timeout；"
+             "省略时查询全部原因。与 --url、--status 同用时取交集。"
+             "裸 --reason（缺少值）或其他值均为参数错误",
     )
     p_recent.add_argument(
         "--limit",
