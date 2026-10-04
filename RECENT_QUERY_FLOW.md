@@ -105,7 +105,7 @@ python healthcheck.py --db <数据库路径> recent \
 `--since` 由 `validate_since_filter`（`healthcheck.py:253-273`）校验并解析，
 格式由常量 `UTC_TIMESTAMP_RE` / `UTC_TIMESTAMP_BODY_RE`
 （`healthcheck.py:66-74`）约束，逐时刻解析由 `parse_utc_timestamp`
-（`healthcheck.py:204-225`）完成，中文错误原因由 `since_format_problem`
+（`healthcheck.py:204-225`）完成，中文错误原因由 `utc_timestamp_format_problem`
 （`healthcheck.py:228-250`）给出。
 
 **合法格式**：`YYYY-MM-DDTHH:MM:SS`，秒后可带**一至六位**小数，并且必须以
@@ -123,7 +123,7 @@ python healthcheck.py --db <数据库路径> recent \
 **非法取值一律经 `die` 以退出码 `2` 拒绝，stdout 为空，stderr 以
 「`since 参数错误：--since …`」指出 `since` 与具体原因**。各情形与原因关键词：
 
-| 非法情形 | 示例 | stderr 中的原因（`since_format_problem`） |
+| 非法情形 | 示例 | stderr 中的原因（`utc_timestamp_format_problem`） |
 |---|---|---|
 | 缺值（裸 `--since`，命令行未给值） | `--since`（置于末尾） | 「--since 必须提供值……实际缺少值」（哨兵 `SINCE_FILTER_MISSING`，`healthcheck.py:61`） |
 | 空值 | `--since ""` | 「值不能为空」 |
@@ -728,7 +728,7 @@ id 1 的零耗时参与统计（min 为 0，count 仍为 2）；均值 `(10 + 0)
 | 裸 `--status` 缺少值 | 哨兵 `STATUS_FILTER_MISSING` 被同一校验拒绝，信息说明「--status 必须提供值」（`healthcheck.py:165-169, 651-654`） |
 | 非法 `--reason`（非四个固定值、大小写不符、空字符串、前后空白） | `validate_reason_filter` → `die`，前缀 `healthcheck: error:`，信息含「reason 参数错误」并回显实际值（`healthcheck.py:178-201, 505`） |
 | 裸 `--reason` 缺少值 | 哨兵 `REASON_FILTER_MISSING` 被同一校验拒绝，信息说明「--reason 必须提供值……实际缺少值」（`healthcheck.py:189-194, 661-664`） |
-| 非法 `--since`（缺值、空值、前后空白、缺时区、非 UTC 偏移、非法日期、七位小数等） | `validate_since_filter` / `since_format_problem` → `die`，信息以「since 参数错误：--since …」指出 since 与原因并回显实际值（`healthcheck.py:228-273, 510`）；逐条见第 9.1 节 |
+| 非法 `--since`（缺值、空值、前后空白、缺时区、非 UTC 偏移、非法日期、七位小数等） | `validate_since_filter` / `utc_timestamp_format_problem` → `die`，信息以「since 参数错误：--since …」指出 since 与原因并回显实际值（`healthcheck.py:228-273, 510`）；逐条见第 9.1 节 |
 | 启用 `--since` 时候选记录 `checked_at` 非法（即使在 limit 之外） | `filter_rows_by_since` → `die`，信息为「记录 id=<id> 的 checked_at 不符合 UTC 时间格式……」并回显原始值（`healthcheck.py:288-294`）；见第 9.2 节 |
 | 非法 `--url`（非 http、非 127.0.0.1、缺端口、端口越界、userinfo、含 `#`、空白或结构非法等） | `validate_target_url` → `die`，前缀 `healthcheck: error:`，并回显非法输入（`healthcheck.py:300-350, 499-500`） |
 | 非法 `--limit`（0、负数、`1.5`、非数字） | argparse 在进入 `command_recent` **之前**拒绝，退出码 2、stdout 空、用法与原因写 stderr（`positive_limit`，`healthcheck.py:145-153`） |
@@ -796,7 +796,7 @@ reason 都合法后非法 since 仍先于目录/缺库错误，且此时数据�
 | status 必须为区分大小写的 success/failure，且最先校验 | `validate_status_filter` / 哨兵 `STATUS_FILTER_MISSING` | `156-175` / `41`，调用点 `494` |
 | URL 合法性规则（先于 reason/since/DB 路径、晚于 status 执行） | `validate_target_url` | `300-350`，调用点 `499-500` |
 | reason 必须为区分大小写的四个固定值；status、URL 之后、since/DB 之前校验 | `validate_reason_filter` / 哨兵 `REASON_FILTER_MISSING` / `REASON_FILTER_CHOICES` | `178-201` / `48` / `52-57`，调用点 `505` |
-| since 合法格式与真实性；status/URL/reason 之后、DB 之前校验 | `validate_since_filter` / `since_format_problem` / 哨兵 `SINCE_FILTER_MISSING` | `253-273` / `228-250` / `61`，调用点 `510` |
+| since 合法格式与真实性；status/URL/reason 之后、DB 之前校验 | `validate_since_filter` / `utc_timestamp_format_problem` / 哨兵 `SINCE_FILTER_MISSING` | `253-273` / `228-250` / `61`，调用点 `510` |
 | since/checked_at 的严格 UTC 正则与等价解析（Z≡+00:00、零小数≡省略） | `UTC_TIMESTAMP_RE` / `UTC_TIMESTAMP_BODY_RE` / `parse_utc_timestamp` | `66-74` / `72-74` / `204-225` |
 | 启用 since：逐条校验 checked_at、`>=` 按时刻保留、先于 limit 限量 | `filter_rows_by_since` | `276-297`，调用点 `574-576` |
 | limit 必须为正整数、默认 5 | `positive_limit` / `DEFAULT_LIMIT` | `145-153` / `29` |
