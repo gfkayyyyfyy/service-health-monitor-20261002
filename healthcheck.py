@@ -7,6 +7,7 @@
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/health?detail=1
     python healthcheck.py --db monitor.sqlite recent --status failure --limit 5
     python healthcheck.py --db monitor.sqlite recent --url http://127.0.0.1:8765/ --reason timeout
+    python healthcheck.py --db monitor.sqlite recent --since 2026-10-04T00:00:02Z --limit 2
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status failure --reason timeout --limit 2
 """
 
@@ -16,6 +17,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import sqlite3
 import sys
 import time
@@ -54,6 +56,23 @@ REASON_FILTER_CHOICES = (
     REASON_TIMEOUT,
 )
 
+# 裸 --since（命令行上未给值）时 argparse 注入的哨兵；
+# 区别于「完全省略该参数」的 None（None 表示不按起始时间筛选）
+SINCE_FILTER_MISSING = object()
+
+# --since 与记录 checked_at 共用的严格 UTC 格式：
+# YYYY-MM-DDTHH:MM:SS，秒后可带一至六位小数，仅以 Z 或 +00:00 结尾；
+# 日期时间是否真实存在由 datetime 构造另行校验
+UTC_TIMESTAMP_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|\+00:00)"
+)
+
+# 上一条正则去掉时区部分后的前缀形态，用于在 fullmatch 失败时
+# 区分「缺时区」「非 UTC 偏移」等具体原因
+UTC_TIMESTAMP_BODY_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+)
+
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS checks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,15 +99,16 @@ REQUIRED_COLUMNS = (
 
 # 唯一的历史查询模板：{table} 在执行时替换为库中历史表的实际表名（加引号），
 # 以兼容 CHECKS / Checks 等仅大小写不同的历史表名；{where} 替换为按当前
-# 筛选组合生成的 WHERE 子句（无筛选时为空字符串）。三个可选筛选
-# （url/status/reason）共八种组合，统一由 build_recent_query 组装，
-# 不再为每种组合单独维护一条 SQL。
+# 筛选组合生成的 WHERE 子句（无筛选时为空字符串）；{limit} 替换为
+# "LIMIT ?" 或空字符串（--since 生效时时间筛选在 Python 侧完成，
+# SQL 不截断，过滤后才限量）。三个可选筛选（url/status/reason）共八种组合，
+# 统一由 build_recent_query 组装，不再为每种组合单独维护一条 SQL。
 SELECT_SQL = """
 SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
 FROM {table}
 {where}
 ORDER BY id DESC
-LIMIT ?
+{limit}
 """
 
 # 三个可选筛选各自的 WHERE 条件片段，按 url → status → reason 的固定顺序
@@ -179,6 +199,102 @@ def validate_reason_filter(value):
         "'connection_error' 或 'timeout'（省略时查询全部原因），"
         f"实际值 {value!r}"
     )
+
+
+def parse_utc_timestamp(value):
+    """严格解析 YYYY-MM-DDTHH:MM:SS[.1-6位小数](Z|+00:00)，返回 UTC aware
+    datetime；格式不符或日期时间不真实存在时返回 None。
+
+    Z 与 +00:00 等价，省略零小数与显式零小数解析为同一时刻。
+    """
+    if not isinstance(value, str):
+        return None
+    m = UTC_TIMESTAMP_RE.fullmatch(value)
+    if m is None:
+        return None
+    year, month, day, hour, minute, second, fraction, _tz = m.groups()
+    microsecond = int((fraction or "0").ljust(6, "0"))
+    try:
+        return datetime(
+            int(year), int(month), int(day),
+            int(hour), int(minute), int(second), microsecond,
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        # 结构合法但日期时间不存在（如 2026-02-30、25:00:00）
+        return None
+
+
+def since_format_problem(value):
+    """--since 取值的中文错误原因；返回 None 表示格式与日期时间均合法。"""
+    if not isinstance(value, str) or value == "":
+        return "值不能为空"
+    if value != value.strip():
+        return "前后不允许有空白"
+    if UTC_TIMESTAMP_RE.fullmatch(value) is not None:
+        if parse_utc_timestamp(value) is None:
+            return "日期或时间必须真实存在"
+        return None
+    body = UTC_TIMESTAMP_BODY_RE.match(value)
+    if body is not None:
+        suffix = value[body.end():]
+        if suffix == "":
+            return "缺少时区，必须以 Z 或 +00:00 结尾"
+        if suffix not in ("Z", "+00:00") and re.fullmatch(
+            r"[+-]\d{2}:\d{2}", suffix
+        ):
+            return f"仅接受 UTC 时区（Z 或 +00:00），不接受偏移 {suffix}"
+    return (
+        "格式必须为 YYYY-MM-DDTHH:MM:SS（秒后可带一至六位小数），"
+        "并以 Z 或 +00:00 结尾"
+    )
+
+
+def validate_since_filter(value):
+    """--since 只接受 YYYY-MM-DDTHH:MM:SS[.1-6位小数](Z|+00:00) 且日期时间
+    真实存在；None 表示不筛选。
+
+    缺值（裸 --since）、空值、前后空白、缺时区、非 UTC 偏移、非法日期时间
+    均经 die 以退出码 2 拒绝（stderr 指出 --since 及原因，stdout 为空）。
+    此检查在 status、URL、reason 都合法之后、一切数据库访问之前执行，
+    拒绝时不会读取数据库。返回值用于与记录的 checked_at 按时刻比较。
+    """
+    if value is None:
+        return None
+    if value is SINCE_FILTER_MISSING:
+        die(
+            "since 参数错误：--since 必须提供值，格式为 "
+            "YYYY-MM-DDTHH:MM:SS（秒后可带一至六位小数）"
+            "并以 Z 或 +00:00 结尾，实际缺少值"
+        )
+    problem = since_format_problem(value)
+    if problem is not None:
+        die(f"since 参数错误：--since {problem}，实际值 {value!r}")
+    return parse_utc_timestamp(value)
+
+
+def filter_rows_by_since(rows, since, limit):
+    """--since 生效时的后处理：逐条校验 checked_at 的 UTC 格式，保留不早于
+    since 的记录，最后沿用 id 倒序取前 limit 条。
+
+    rows 已由 SQL 按其余筛选条件过滤并按 id 倒序排列。符合其余筛选的
+    记录只要 checked_at 不符合严格 UTC 格式，即经 die 以退出码 2 拒绝并
+    指出记录 id（不修改任何数据）；校验针对全部符合其余筛选的记录，
+    在 limit 截取之前完成。比较按时刻进行：Z 与 +00:00、省略零小数的
+    写法视为同一时刻；输出仍使用记录保存的原始字符串。
+    """
+    kept = []
+    for row in rows:
+        checked_at = parse_utc_timestamp(row[2])
+        if checked_at is None:
+            die(
+                f"记录 id={row[0]} 的 checked_at 不符合 UTC 时间格式"
+                "（YYYY-MM-DDTHH:MM:SS，秒后可带一至六位小数，"
+                f"以 Z 或 +00:00 结尾）: {row[2]!r}"
+            )
+        if checked_at >= since:
+            kept.append(row)
+    return kept[:limit]
 
 
 def validate_target_url(raw_url):
@@ -342,14 +458,17 @@ def command_check(args):
     return 0 if status == STATUS_SUCCESS else 1
 
 
-def build_recent_query(quoted_table, filters):
+def build_recent_query(quoted_table, filters, sql_limit=True):
     """按当前筛选组合组装历史查询的 SQL 与绑定参数。
 
     filters 为 ((列名, 值), ...) 形式的可选筛选（值为 None 的项表示不筛选）。
     所有给定条件取交集（AND）：url 用原始字符串精确匹配，status/reason 按
     保存值等值匹配；reason 只看记录自身的 reason 字段，绝不从
     status/http_status 推断。无论哪种组合，都是先按全部条件筛选，
-    再按 id 倒序取前 limit 条（limit 占位符由调用方绑定）。
+    再按 id 倒序排列。sql_limit 为 True 时附加 LIMIT ? 占位符
+    （由调用方绑定 limit）；为 False 时不加 LIMIT——--since 生效时
+    时间条件在 Python 侧按时刻比较，须先取出符合其余筛选的全部记录，
+    过滤后才截取 limit 条。
     """
     clauses = {
         name: clause for name, clause in RECENT_FILTER_CLAUSES
@@ -361,7 +480,8 @@ def build_recent_query(quoted_table, filters):
             conditions.append(clauses[name])
             params.append(value)
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    sql = SELECT_SQL.format(table=quoted_table, where=where)
+    limit_clause = "LIMIT ?" if sql_limit else ""
+    sql = SELECT_SQL.format(table=quoted_table, where=where, limit=limit_clause)
     return sql, params
 
 
@@ -383,6 +503,11 @@ def command_recent(args):
     # 非法值（含空字符串、裸 --reason 缺值、前后空白）同样在读取数据库前
     # 即以退出码 2 拒绝。reason 只按保存值精确匹配，绝不从状态码推断。
     reason_filter = validate_reason_filter(args.reason)
+
+    # status、URL、reason 都合法后再校验 --since（UTC 起始时间）：
+    # 缺值、空值、前后空白、缺时区、非 UTC 偏移、非法日期时间同样在
+    # 读取数据库前即以退出码 2 拒绝。省略时不增加任何时间条件。
+    since_filter = validate_since_filter(args.since)
 
     # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
     # 不创建文件、不创建目录、不发任何网络请求
@@ -429,7 +554,10 @@ def command_recent(args):
                 ensure_checks_columns(conn)
                 quoted = '"' + checks_table.replace('"', '""') + '"'
                 # 三个可选筛选共八种组合，统一由 build_recent_query 组装：
-                # 条件之间一律 AND，先按全部条件筛选，再按 id 倒序限量
+                # 条件之间一律 AND，先按全部条件筛选，再按 id 倒序排列。
+                # --since 生效时 SQL 不加 LIMIT：时间条件在 Python 侧按时刻
+                # 比较（Z 与 +00:00、省略零小数视为同一时刻），须先取出符合
+                # 其余筛选的全部记录，校验并过滤后才截取 limit 条
                 sql, params = build_recent_query(
                     quoted,
                     (
@@ -437,8 +565,15 @@ def command_recent(args):
                         ("status", status_filter),
                         ("reason", reason_filter),
                     ),
+                    sql_limit=since_filter is None,
                 )
-                rows = conn.execute(sql, (*params, args.limit)).fetchall()
+                if since_filter is None:
+                    rows = conn.execute(sql, (*params, args.limit)).fetchall()
+                else:
+                    rows = conn.execute(sql, params).fetchall()
+                    rows = filter_rows_by_since(
+                        rows, since_filter, args.limit
+                    )
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -532,6 +667,18 @@ def build_parser():
              "的 ok、http_status、connection_error、timeout；不从状态码推断，"
              "省略时查询全部原因。与 --url、--status 同用时取交集。"
              "裸 --reason（缺少值）或其他值均为参数错误",
+    )
+    p_recent.add_argument(
+        "--since",
+        nargs="?",
+        const=SINCE_FILTER_MISSING,
+        default=None,
+        metavar="YYYY-MM-DDTHH:MM:SS[.ffffff](Z|+00:00)",
+        help="可选：仅返回 checked_at 不早于该 UTC 时刻的记录，格式为 "
+             "YYYY-MM-DDTHH:MM:SS（秒后可带一至六位小数）并以 Z 或 +00:00 "
+             "结尾，日期时间须真实存在；Z 与 +00:00、省略零小数按同一时刻"
+             "比较。与 --url、--status、--reason 同用时取交集，省略时不增加"
+             "时间条件。裸 --since（缺少值）或格式非法均为参数错误",
     )
     p_recent.add_argument(
         "--limit",
