@@ -78,70 +78,26 @@ REQUIRED_COLUMNS = (
     "id", "url", "checked_at", "elapsed_ms", "status", "http_status", "reason",
 )
 
-# 四条查询的 {table} 在执行时替换为库中历史表的实际表名（加引号），
-# 以兼容 CHECKS / Checks 等仅大小写不同的历史表名
+# 唯一的历史查询模板：{table} 在执行时替换为库中历史表的实际表名（加引号），
+# 以兼容 CHECKS / Checks 等仅大小写不同的历史表名；{where} 替换为按当前
+# 筛选组合生成的 WHERE 子句（无筛选时为空字符串）。三个可选筛选
+# （url/status/reason）共八种组合，统一由 build_recent_query 组装，
+# 不再为每种组合单独维护一条 SQL。
 SELECT_SQL = """
 SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
 FROM {table}
+{where}
 ORDER BY id DESC
 LIMIT ?
 """
 
-SELECT_BY_URL_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE url = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_STATUS_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE status = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_URL_STATUS_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE url = ? AND status = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_REASON_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE reason = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_URL_REASON_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE url = ? AND reason = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_STATUS_REASON_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE status = ? AND reason = ?
-ORDER BY id DESC
-LIMIT ?
-"""
-
-SELECT_BY_URL_STATUS_REASON_SQL = """
-SELECT id, url, checked_at, elapsed_ms, status, http_status, reason
-FROM {table}
-WHERE url = ? AND status = ? AND reason = ?
-ORDER BY id DESC
-LIMIT ?
-"""
+# 三个可选筛选各自的 WHERE 条件片段，按 url → status → reason 的固定顺序
+# 拼接（与原八条独立 SQL 中条件的书写顺序一致），条件之间一律 AND
+RECENT_FILTER_CLAUSES = (
+    ("url", "url = ?"),
+    ("status", "status = ?"),
+    ("reason", "reason = ?"),
+)
 
 # 无记录时的摘要输出（count 为 0、耗时字段为 null）
 NULL_SUMMARY_JSON = (
@@ -386,6 +342,29 @@ def command_check(args):
     return 0 if status == STATUS_SUCCESS else 1
 
 
+def build_recent_query(quoted_table, filters):
+    """按当前筛选组合组装历史查询的 SQL 与绑定参数。
+
+    filters 为 ((列名, 值), ...) 形式的可选筛选（值为 None 的项表示不筛选）。
+    所有给定条件取交集（AND）：url 用原始字符串精确匹配，status/reason 按
+    保存值等值匹配；reason 只看记录自身的 reason 字段，绝不从
+    status/http_status 推断。无论哪种组合，都是先按全部条件筛选，
+    再按 id 倒序取前 limit 条（limit 占位符由调用方绑定）。
+    """
+    clauses = {
+        name: clause for name, clause in RECENT_FILTER_CLAUSES
+    }
+    conditions = []
+    params = []
+    for name, value in filters:
+        if value is not None:
+            conditions.append(clauses[name])
+            params.append(value)
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    sql = SELECT_SQL.format(table=quoted_table, where=where)
+    return sql, params
+
+
 def command_recent(args):
     db_path = args.db
 
@@ -449,57 +428,17 @@ def command_recent(args):
                 # 不再误判为空历史
                 ensure_checks_columns(conn)
                 quoted = '"' + checks_table.replace('"', '""') + '"'
-                # 三个可选筛选共八种组合，条件之间一律 AND：
-                # url 用原始字符串精确匹配，status/reason 按保存值等值匹配；
-                # reason 只看记录自身的 reason 字段，绝不从 status/http_status
-                # 推断。所有组合都是先按全部条件筛选，再按 id 倒序限量。
-                if (
-                    args.url is not None
-                    and status_filter is not None
-                    and reason_filter is not None
-                ):
-                    rows = conn.execute(
-                        SELECT_BY_URL_STATUS_REASON_SQL.format(table=quoted),
-                        (args.url, status_filter, reason_filter, args.limit),
-                    ).fetchall()
-                elif args.url is not None and status_filter is not None:
-                    rows = conn.execute(
-                        SELECT_BY_URL_STATUS_SQL.format(table=quoted),
-                        (args.url, status_filter, args.limit),
-                    ).fetchall()
-                elif args.url is not None and reason_filter is not None:
-                    rows = conn.execute(
-                        SELECT_BY_URL_REASON_SQL.format(table=quoted),
-                        (args.url, reason_filter, args.limit),
-                    ).fetchall()
-                elif status_filter is not None and reason_filter is not None:
-                    rows = conn.execute(
-                        SELECT_BY_STATUS_REASON_SQL.format(table=quoted),
-                        (status_filter, reason_filter, args.limit),
-                    ).fetchall()
-                elif reason_filter is not None:
-                    # 仅按记录保存的 reason 精确匹配，不区分 status
-                    rows = conn.execute(
-                        SELECT_BY_REASON_SQL.format(table=quoted),
-                        (reason_filter, args.limit),
-                    ).fetchall()
-                elif status_filter is not None:
-                    # 仅按记录的 status 筛选，不区分失败原因（reason）
-                    rows = conn.execute(
-                        SELECT_BY_STATUS_SQL.format(table=quoted),
-                        (status_filter, args.limit),
-                    ).fetchall()
-                elif args.url is not None:
-                    # 按数据库中保存的原始 url 字符串精确匹配：
-                    # 不合并路径或查询参数不同的地址，也不规范化 URL
-                    rows = conn.execute(
-                        SELECT_BY_URL_SQL.format(table=quoted),
-                        (args.url, args.limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        SELECT_SQL.format(table=quoted), (args.limit,)
-                    ).fetchall()
+                # 三个可选筛选共八种组合，统一由 build_recent_query 组装：
+                # 条件之间一律 AND，先按全部条件筛选，再按 id 倒序限量
+                sql, params = build_recent_query(
+                    quoted,
+                    (
+                        ("url", args.url),
+                        ("status", status_filter),
+                        ("reason", reason_filter),
+                    ),
+                )
+                rows = conn.execute(sql, (*params, args.limit)).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
