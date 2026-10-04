@@ -384,6 +384,23 @@ def ensure_checks_columns(conn):
         die("checks 表缺少字段: " + ", ".join(missing))
 
 
+def encode_request_target(target):
+    """把请求目标中的非 ASCII 字符按 UTF-8 字节转成大写十六进制百分号编码。
+
+    只改动非 ASCII 字符：已存在的百分号编码（连同字母大小写）、查询中的
+    '+'、路径分隔符、参数顺序及其余 ASCII 内容全部原样保留，混合中文与
+    编码内容不会重复编码（%23 不会变成 %2523）。仅用于发送请求时的请求
+    目标，不影响落库与输出所使用的中文原始 URL。
+    """
+    parts = []
+    for ch in target:
+        if ord(ch) > 127:
+            parts.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
+        else:
+            parts.append(ch)
+    return "".join(parts)
+
+
 def probe_once(port, target, timeout):
     """发送且仅发送一次 GET，不跟随重定向。
 
@@ -421,8 +438,10 @@ def command_check(args):
     # 探测前先确保数据库可用，不可用则不发请求
     conn = open_database(args.db)
     try:
+        # 发送前把未编码的非 ASCII（如中文路径/查询值）百分号编码；
+        # 落库与输出仍使用 args.url 的中文原文
         status, http_status, reason, elapsed_ms = probe_once(
-            port, target, args.timeout
+            port, encode_request_target(target), args.timeout
         )
         checked_at = utc_now_iso()
         record = {
