@@ -126,18 +126,6 @@ RECENT_FILTER_CLAUSES = (
     ("reason", "reason = ?"),
 )
 
-# 无记录时的摘要输出（count 为 0、耗时字段为 null）
-NULL_SUMMARY_JSON = (
-    '{"count":0,"min_elapsed_ms":null,'
-    '"max_elapsed_ms":null,"avg_elapsed_ms":null}'
-)
-
-# 无记录时的状态摘要输出（三个计数均为 0）
-NULL_STATUS_SUMMARY_JSON = (
-    '{"count":0,"success_count":0,"failure_count":0}'
-)
-
-
 def die(message):
     """参数或数据库错误：写 stderr，以退出码 2 结束（stdout 保持为空）。"""
     print(f"healthcheck: error: {message}", file=sys.stderr)
@@ -549,6 +537,67 @@ def build_recent_query(quoted_table, filters, sql_limit=True):
     return sql, params
 
 
+def render_recent_result(rows, summary=False, status_summary=False):
+    """recent 三种模式共用的唯一结果呈现入口：同一批记录 → 紧凑单行 JSON。
+
+    rows 为筛选、时间窗口与 limit 处理后的最终记录（SQL 行元组，id 倒序）。
+    无论记录来自数据库查询还是空历史（缺库、无历史表、空表、筛选无匹配），
+    都经此函数输出，空结果只是 rows 为空的特例，不再单独维护输出分支：
+
+    - 普通模式：七字段记录数组（id/url/checked_at/elapsed_ms/status/
+      http_status/reason），原始 URL、时间字符串与中文原样保留；
+    - summary：耗时摘要，成功与失败记录、零耗时均计入，平均值不取整；
+      无记录时 count 为 0、三个耗时字段为 null；
+    - status_summary：状态摘要，只按保存的 status 字段分类计数，绝不从
+      reason 或 http_status 推断；无记录时三个计数均为 0。
+
+    输出均为紧凑单行 JSON（键序固定）加一个换行，返回退出码 0。
+    """
+    if summary:
+        elapsed_values = [row[3] for row in rows]
+        if elapsed_values:
+            count = len(elapsed_values)
+            result = {
+                "count": count,
+                "min_elapsed_ms": min(elapsed_values),
+                "max_elapsed_ms": max(elapsed_values),
+                # 平均值不取整，以 JSON 数字原样输出
+                "avg_elapsed_ms": sum(elapsed_values) / count,
+            }
+        else:
+            result = {
+                "count": 0,
+                "min_elapsed_ms": None,
+                "max_elapsed_ms": None,
+                "avg_elapsed_ms": None,
+            }
+    elif status_summary:
+        result = {
+            "count": len(rows),
+            "success_count": sum(
+                1 for row in rows if row[4] == STATUS_SUCCESS
+            ),
+            "failure_count": sum(
+                1 for row in rows if row[4] == STATUS_FAILURE
+            ),
+        }
+    else:
+        result = [
+            {
+                "id": row[0],
+                "url": row[1],
+                "checked_at": row[2],
+                "elapsed_ms": row[3],
+                "status": row[4],
+                "http_status": row[5],
+                "reason": row[6],
+            }
+            for row in rows
+        ]
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
 def command_recent(args):
     db_path = args.db
 
@@ -595,19 +644,31 @@ def command_recent(args):
             "起点不得晚于终点（二者相等时为只含同一时刻的合法窗口）"
         )
 
+    # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
+    # 不创建文件、不创建目录、不发任何网络请求；空历史与查询出的空结果
+    # 一样走下方统一的结果呈现（rows 为空即空数组/空摘要）
+    if not os.path.exists(db_path):
+        rows = []
+    else:
+        rows = query_recent_rows(args, db_path, status_filter, reason_filter,
+                                 since_filter, until_filter)
+
+    return render_recent_result(
+        rows, summary=args.summary, status_summary=args.status_summary
+    )
+
+
+def query_recent_rows(args, db_path, status_filter, reason_filter,
+                      since_filter, until_filter):
+    """打开只读连接并按当前筛选取出 recent 的最终记录（SQL 行元组，id 倒序）。
+
+    只在数据库文件存在时调用；目录路径、无效 SQLite 文件、历史表缺字段、
+    时间筛选遇到非法 checked_at 等错误仍在此处经 die 以退出码 2 报告
+    （stdout 为空），错误顺序与说明保持不变。无历史表或筛选无匹配时返回
+    空列表，由调用方走统一的结果呈现。
+    """
     # 任一时间边界生效时，时间比较都在 Python 侧完成
     time_filter_active = since_filter is not None or until_filter is not None
-
-    # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
-    # 不创建文件、不创建目录、不发任何网络请求
-    if not os.path.exists(db_path):
-        if args.summary:
-            print(NULL_SUMMARY_JSON)
-        elif args.status_summary:
-            print(NULL_STATUS_SUMMARY_JSON)
-        else:
-            print("[]")
-        return 0
 
     # 路径指向目录不是有效的数据库文件
     if os.path.isdir(db_path):
@@ -638,102 +699,37 @@ def command_recent(args):
             )
             if checks_table is None:
                 # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
-                rows = []
-            else:
-                # 表存在但缺任一所需字段：以退出码 2 说明缺列，
-                # 不再误判为空历史
-                ensure_checks_columns(conn)
-                quoted = '"' + checks_table.replace('"', '""') + '"'
-                # 三个可选筛选共八种组合，统一由 build_recent_query 组装：
-                # 条件之间一律 AND，先按全部条件筛选，再按 id 倒序排列。
-                # 任一时间边界生效时 SQL 不加 LIMIT：时间条件在 Python 侧
-                # 按时刻比较（Z 与 +00:00、省略零小数视为同一时刻），须先
-                # 取出符合其余筛选的全部记录，校验并过滤后才截取 limit 条
-                sql, params = build_recent_query(
-                    quoted,
-                    (
-                        ("url", args.url),
-                        ("status", status_filter),
-                        ("reason", reason_filter),
-                    ),
-                    sql_limit=not time_filter_active,
-                )
-                if not time_filter_active:
-                    rows = conn.execute(sql, (*params, args.limit)).fetchall()
-                else:
-                    rows = conn.execute(sql, params).fetchall()
-                    rows = filter_rows_by_since(
-                        rows, since_filter, args.limit, until_filter
-                    )
+                return []
+            # 表存在但缺任一所需字段：以退出码 2 说明缺列，
+            # 不再误判为空历史
+            ensure_checks_columns(conn)
+            quoted = '"' + checks_table.replace('"', '""') + '"'
+            # 三个可选筛选共八种组合，统一由 build_recent_query 组装：
+            # 条件之间一律 AND，先按全部条件筛选，再按 id 倒序排列。
+            # 任一时间边界生效时 SQL 不加 LIMIT：时间条件在 Python 侧
+            # 按时刻比较（Z 与 +00:00、省略零小数视为同一时刻），须先
+            # 取出符合其余筛选的全部记录，校验并过滤后才截取 limit 条
+            sql, params = build_recent_query(
+                quoted,
+                (
+                    ("url", args.url),
+                    ("status", status_filter),
+                    ("reason", reason_filter),
+                ),
+                sql_limit=not time_filter_active,
+            )
+            if not time_filter_active:
+                return conn.execute(sql, (*params, args.limit)).fetchall()
+            rows = conn.execute(sql, params).fetchall()
+            return filter_rows_by_since(
+                rows, since_filter, args.limit, until_filter
+            )
         finally:
             conn.close()
     except sqlite3.Error as exc:
         # 文件不是有效 SQLite 数据库、读取失败等
         # （checks 表缺字段已在查询前由 ensure_checks_columns 单独报告）
         die(f"读取数据库 {db_path!r} 失败: {exc}")
-
-    if args.summary:
-        # 摘要模式：对 recent 本会返回的同一批记录（同样的 URL 精确筛选、
-        # id 倒序、limit 截取）统计耗时，成功与失败记录、零耗时均计入。
-        elapsed_values = [row[3] for row in rows]
-        if elapsed_values:
-            count = len(elapsed_values)
-            summary = {
-                "count": count,
-                "min_elapsed_ms": min(elapsed_values),
-                "max_elapsed_ms": max(elapsed_values),
-                # 平均值不取整，以 JSON 数字原样输出
-                "avg_elapsed_ms": sum(elapsed_values) / count,
-            }
-        else:
-            # 无记录（含数据库不存在、无 checks 表、筛选无匹配）：
-            # count 为 0，耗时字段为 null，退出码仍为 0
-            summary = {
-                "count": 0,
-                "min_elapsed_ms": None,
-                "max_elapsed_ms": None,
-                "avg_elapsed_ms": None,
-            }
-        print(json.dumps(summary, separators=(",", ":"), ensure_ascii=False))
-        return 0
-
-    if args.status_summary:
-        # 状态摘要模式：对 recent 本会返回的同一批记录（同样的筛选、
-        # id 倒序、limit 截取）按保存的 status 字段计数；只依据 status，
-        # 绝不从 reason 或 http_status 推断，零耗时与各种失败原因的记录
-        # 均参与计数。无记录（含数据库不存在、无 checks 表、筛选无匹配）
-        # 时三个计数均为 0，退出码仍为 0
-        success_count = sum(
-            1 for row in rows if row[4] == STATUS_SUCCESS
-        )
-        failure_count = sum(
-            1 for row in rows if row[4] == STATUS_FAILURE
-        )
-        status_summary = {
-            "count": len(rows),
-            "success_count": success_count,
-            "failure_count": failure_count,
-        }
-        print(
-            json.dumps(status_summary, separators=(",", ":"),
-                       ensure_ascii=False)
-        )
-        return 0
-
-    records = [
-        {
-            "id": row[0],
-            "url": row[1],
-            "checked_at": row[2],
-            "elapsed_ms": row[3],
-            "status": row[4],
-            "http_status": row[5],
-            "reason": row[6],
-        }
-        for row in rows
-    ]
-    print(json.dumps(records, separators=(",", ":"), ensure_ascii=False))
-    return 0
 
 
 def build_parser():
