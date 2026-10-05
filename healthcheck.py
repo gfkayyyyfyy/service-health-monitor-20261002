@@ -13,6 +13,7 @@
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status failure --reason timeout --limit 2
     python healthcheck.py --db monitor.sqlite recent --status-summary --limit 2
     python healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/health
+    python healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/health --threshold 2
 """
 
 import argparse
@@ -135,6 +136,10 @@ FROM {table}
 WHERE url = ?
 ORDER BY id DESC
 """
+
+# 裸 --threshold（命令行上未给值）时 argparse 注入的哨兵；
+# 区别于「完全省略该参数」的 None（None 表示不做阈值判断，输出原有三字段）
+THRESHOLD_MISSING = object()
 
 def die(message):
     """参数或数据库错误：写 stderr，以退出码 2 结束（stdout 保持为空）。"""
@@ -287,6 +292,44 @@ def validate_time_bound_filter(name, value):
     if problem is not None:
         die(f"{name} 参数错误：--{name} {problem}，实际值 {value!r}")
     return parse_utc_timestamp(value)
+
+
+def validate_threshold(value):
+    """--threshold 只接受 ASCII 十进制数字组成且数值大于零的文本；
+    None 表示省略该参数（不做阈值判断，输出原有三字段 JSON）。
+
+    允许前导零（"02" 合法，输出按整数 2 表示）；缺值（裸参数）、空值、
+    "0"、带正负号、小数、前后或内部空白以及其他字符均经 die 以退出码 2
+    拒绝（stderr 指出 threshold 及原因，stdout 为空）。此检查先于 URL
+    校验与一切数据库访问，拒绝时不会读取数据库。
+    """
+    if value is None:
+        return None
+    if value is THRESHOLD_MISSING:
+        die(
+            "threshold 参数错误：--threshold 必须提供值"
+            "（ASCII 十进制正整数，允许前导零），实际缺少值"
+        )
+    if not isinstance(value, str) or value == "":
+        die(
+            "threshold 参数错误：--threshold 值不能为空，"
+            f"必须是大于零的 ASCII 十进制整数，实际值 {value!r}"
+        )
+    if not value.isascii() or any(not ("0" <= ch <= "9") for ch in value):
+        # 显式逐字符判定 ASCII 0-9：拒绝空白、正负号、小数点、全角数字、
+        # 上标数字（str.isdigit 会误纳 '²'、'０' 等）及其他一切字符
+        die(
+            "threshold 参数错误：--threshold 只接受 ASCII 十进制数字"
+            f"组成的正整数（不接受空白、符号、小数或其他字符），"
+            f"实际值 {value!r}"
+        )
+    threshold = int(value)
+    if threshold <= 0:
+        die(
+            "threshold 参数错误：--threshold 必须大于零，"
+            f"不接受零（允许前导零），实际值 {value!r}"
+        )
+    return threshold
 
 
 def filter_rows_by_since(rows, since, limit, until=None):
@@ -770,30 +813,43 @@ def count_consecutive_failures(rows):
     return count
 
 
-def render_streak_result(url, latest_id, consecutive_failures):
+def render_streak_result(url, latest_id, consecutive_failures, threshold=None):
     """streak 唯一输出形态：紧凑单行 JSON，字段名与顺序固定。
 
-    url 保留命令行输入原文，不做任何规范化。
+    url 保留命令行输入原文，不做任何规范化。threshold 为 None（省略
+    --threshold）时输出原有三字段；给出合法阈值时追加 threshold（按整数
+    表示，前导零不归入输出）与 threshold_reached（连续失败次数大于或等于
+    阈值时为 true，否则为 false）。阈值判断只读、不保存规则、不生成事件，
+    两种结果都以退出码 0 结束。
     """
     payload = {
         "url": url,
         "latest_id": latest_id,
         "consecutive_failures": consecutive_failures,
     }
+    if threshold is not None:
+        payload["threshold"] = threshold
+        payload["threshold_reached"] = consecutive_failures >= threshold
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
 def command_streak(args):
-    # 先校验目标 URL（沿用 check 的本机地址规则），非法地址在访问数据库前
+    # 先校验 --threshold（若给出）：缺值、空值、零、负数、小数、空白或其他
+    # 字符在 URL 校验与一切数据库访问之前即以退出码 2 拒绝，stdout 为空。
+    # 省略时为 None，保留原有三字段输出。
+    threshold = validate_threshold(args.threshold)
+
+    # 再校验目标 URL（沿用 check 的本机地址规则），非法地址在访问数据库前
     # 即以退出码 2 拒绝。校验通过即可，匹配仍使用原始字符串，不做规范化。
     validate_target_url(args.url)
 
     # streak 严格只读：文件尚不存在（含父目录不存在）、空库、无历史表或
-    # 该目标无记录时返回 latest_id 为 null、consecutive_failures 为 0，
-    # 不创建文件、目录或表，不发任何网络请求
+    # 该目标无记录时返回 latest_id 为 null、consecutive_failures 为 0
+    # （给出阈值时 threshold_reached 为 false），不创建文件、目录或表，
+    # 不发任何网络请求
     conn = open_history_db_readonly(args.db)
     if conn is None:
-        render_streak_result(args.url, None, 0)
+        render_streak_result(args.url, None, 0, threshold)
         return 0
 
     try:
@@ -819,6 +875,9 @@ def command_streak(args):
                     consecutive_failures = 0
                 else:
                     latest_id = rows[0][0]
+                    # 连续段内非法 status 仍按记录 id 以退出码 2 拒绝，
+                    # 即使此前累计次数已达到阈值也照样拒绝；比首条 success
+                    # 更旧的记录不会被看到，不影响结果
                     consecutive_failures = count_consecutive_failures(rows)
         finally:
             conn.close()
@@ -827,7 +886,9 @@ def command_streak(args):
         # （checks 表缺字段已在查询前由 ensure_checks_columns 单独报告）
         die(f"读取数据库 {args.db!r} 失败: {exc}")
 
-    render_streak_result(args.url, latest_id, consecutive_failures)
+    render_streak_result(
+        args.url, latest_id, consecutive_failures, threshold
+    )
     return 0
 
 
@@ -933,6 +994,20 @@ def build_parser():
              "（规则同 check：仅 http://127.0.0.1:端口/...）；"
              "连续段只按 id 倒序的保存 status 判定，不支持 recent 的"
              "筛选与限量选项",
+    )
+    p_streak.add_argument(
+        "--threshold",
+        nargs="?",
+        const=THRESHOLD_MISSING,
+        default=None,
+        metavar="N",
+        help="可选：本次查询内的连续失败阈值，只接受 ASCII 十进制数字"
+             "组成且大于零的整数（允许前导零，输出按整数表示）。省略时"
+             "输出 url/latest_id/consecutive_failures 三字段；提供时追加"
+             "整数 threshold 与布尔 threshold_reached（连续失败次数大于或"
+             "等于阈值为 true，否则为 false），两种结果均以退出码 0 结束，"
+             "不保存规则、不生成事件。裸 --threshold（缺少值）、空值、零、"
+             "负数、小数、空白或其他字符均为参数错误",
     )
     p_streak.set_defaults(handler=command_streak)
 

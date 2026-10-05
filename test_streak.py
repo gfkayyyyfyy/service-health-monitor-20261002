@@ -5,6 +5,11 @@
 - 连续失败段按 id 倒序自最大 id 起统计 failure 直到首条 success；
 - latest_id 为该目标最大 id；其他目标、reason、http_status、checked_at
   不参与；不受 recent 默认五条限制；
+- 可选 --threshold：省略时输出三字段；给出时追加整数 threshold 与布尔
+  threshold_reached（次数大于或等于阈值为 true），仅接受 ASCII 十进制
+  正整数（允许前导零），缺值/空值/零/负数/小数/空白/其他字符在访问
+  数据库前以退出码 2 拒绝；空历史一律 false；非法 status 即使已达阈值
+  仍以退出码 2 指出记录 id；
 - 无匹配记录、缺库/缺父目录、空库、无历史表、空表 → url 原文 + null + 0；
 - 大小写异写历史表、可读不可写数据库沿用 recent 的兼容范围；
 - 缺参数、非法 URL、不支持的 recent 选项、路径为目录、无效 SQLite、
@@ -110,11 +115,230 @@ class StreakTests(unittest.TestCase):
              "consecutive_failures": failures},
         )
 
+    def assertStreakThreshold(self, proc, url, latest_id, failures,
+                              threshold, reached):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"))
+        self.assertEqual(proc.stdout.count("\n"), 1)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"url": url, "latest_id": latest_id,
+             "consecutive_failures": failures,
+             "threshold": threshold, "threshold_reached": reached},
+        )
+
     def assertRejected(self, proc):
         self.assertEqual(proc.returncode, 2, proc.stdout)
         self.assertEqual(proc.stdout, "")
         self.assertNotEqual(proc.stderr, "")
         self.assertNotIn("Traceback", proc.stderr)
+
+    # ---- 题目给定验收样例 ----
+
+    def test_spec_example_threshold_true_and_false(self):
+        # id 1 目标 A 成功；id 2、4 目标 A 失败；id 3 是另一目标成功
+        db = self.tmp / "m.sqlite"
+        build_db(db, [
+            R(1, URL_A, "success", 200, "ok"),
+            R(2, URL_A, "failure", None, "connection_error"),
+            R(3, URL_B, "success", 200, "ok"),
+            R(4, URL_A, "failure", 500, "http_status"),
+        ])
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "2"),
+            URL_A, 4, 2, 2, True)
+        # 同一查询改为 3：次数 2 < 3 → false
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "3"),
+            URL_A, 4, 2, 3, False)
+        # 边界：次数等于阈值即 true
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "1"),
+            URL_A, 4, 2, 1, True)
+        # 其他目标最新成功：0 次，阈值 1 仍 false
+        self.assertStreakThreshold(
+            run_streak(db, URL_B, "--threshold", "1"),
+            URL_B, 3, 0, 1, False)
+
+    def test_threshold_leading_zeros_output_as_integer(self):
+        db = self.tmp / "m.sqlite"
+        build_db(db, [
+            R(1, URL_A, "failure", None, "timeout"),
+            R(2, URL_A, "failure", None, "timeout"),
+        ])
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "002"),
+            URL_A, 2, 2, 2, True)
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "0003"),
+            URL_A, 2, 2, 3, False)
+
+    def test_threshold_reached_not_capped_by_recent_limit(self):
+        # 12 连败：阈值 10 仍按完整次数判断
+        db = self.tmp / "m.sqlite"
+        build_db(db, [R(i, URL_A, "failure", None, "timeout")
+                      for i in range(1, 13)])
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "10"),
+            URL_A, 12, 12, 10, True)
+
+    def test_threshold_latest_success_zero_false(self):
+        db = self.tmp / "m.sqlite"
+        build_db(db, [
+            R(1, URL_A, "failure", None, "timeout"),
+            R(2, URL_A, "success", 200, "ok"),
+        ])
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "1"),
+            URL_A, 2, 0, 1, False)
+
+    def test_threshold_empty_histories_false(self):
+        # 缺库（含缺父目录）、空库、仅有其他表、空表、无匹配：
+        # latest_id null、次数 0、threshold_reached false
+        missing = self.tmp / "nope" / "deep" / "m.sqlite"
+        self.assertStreakThreshold(
+            run_streak(missing, URL_A, "--threshold", "1"),
+            URL_A, None, 0, 1, False)
+        self.assertFalse((self.tmp / "nope").exists())
+
+        db = self.tmp / "empty.sqlite"
+        sqlite3.connect(str(db)).close()
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "2"),
+            URL_A, None, 0, 2, False)
+
+        other = self.tmp / "other.sqlite"
+        conn = sqlite3.connect(str(other))
+        conn.execute("CREATE TABLE other_t (name TEXT)")
+        conn.commit()
+        conn.close()
+        self.assertStreakThreshold(
+            run_streak(other, URL_A, "--threshold", "2"),
+            URL_A, None, 0, 2, False)
+
+        rowsdb = self.tmp / "b.sqlite"
+        build_db(rowsdb, [R(1, URL_B, "success", 200, "ok")])
+        self.assertStreakThreshold(
+            run_streak(rowsdb, URL_A, "--threshold", "1"),
+            URL_A, None, 0, 1, False)
+
+    def test_threshold_readonly_and_case_tables(self):
+        db = self.tmp / "ro.sqlite"
+        build_db(db, [R(1, URL_A, "failure", None, "timeout")])
+        os.chmod(db, stat.S_IRUSR)
+        try:
+            self.assertStreakThreshold(
+                run_streak(db, URL_A, "--threshold", "1"),
+                URL_A, 1, 1, 1, True)
+        finally:
+            os.chmod(db, stat.S_IRWXU)
+
+        cdb = self.tmp / "c.sqlite"
+        build_db(cdb, [R(1, URL_A, "failure", None, "timeout")],
+                 table="CHECKS")
+        self.assertStreakThreshold(
+            run_streak(cdb, URL_A, "--threshold", "2"),
+            URL_A, 1, 1, 2, False)
+
+    # ---- 阈值非法：退出码 2、stdout 空、访问数据库前拒绝 ----
+
+    def test_invalid_thresholds_rejected_before_db_access(self):
+        missing_parent = self.tmp / "never"
+        db = missing_parent / "x.sqlite"
+        for bad in ("", "0", "000", "-1", "-0", "+1", "1.0", "1.5",
+                    " 2", "2 ", "\t2", "1 2", "abc", "0x1", "1e3",
+                    "²", "０", "１２", "true"):
+            with self.subTest(threshold=bad):
+                proc = run_streak(db, URL_A, "--threshold", bad)
+                self.assertRejected(proc)
+                self.assertIn("threshold", proc.stderr)
+        # 裸 --threshold（缺少值）
+        proc = run_streak(db, URL_A, "--threshold")
+        self.assertRejected(proc)
+        self.assertIn("threshold", proc.stderr)
+        # 任何非法阈值都不得触发数据库路径创建
+        self.assertFalse(os.path.exists(missing_parent))
+
+    def test_invalid_threshold_rejected_before_url_validation(self):
+        # threshold 先于 URL 校验：URL 与阈值同时非法时报 threshold
+        db = self.tmp / "m.sqlite"
+        proc = run_streak(db, "http://localhost:1/x", "--threshold", "0")
+        self.assertRejected(proc)
+        self.assertIn("threshold", proc.stderr)
+
+    # ---- 阈值不改变数据错误边界 ----
+
+    def test_threshold_illegal_status_rejected_even_if_reached(self):
+        # 最新 1 条 failure 已达阈值 1，下一条非法 status 仍须拒绝并指出 id
+        db = self.tmp / "weird.sqlite"
+        build_db(db, [
+            R(1, URL_A, "success", 200, "ok"),
+            R(2, URL_A, "weird"),
+            R(3, URL_A, "failure", None, "timeout"),
+        ])
+        proc = run_streak(db, URL_A, "--threshold", "1")
+        self.assertRejected(proc)
+        self.assertIn("id=2", proc.stderr)
+
+    def test_threshold_illegal_status_older_than_success_ignored(self):
+        db = self.tmp / "old.sqlite"
+        build_db(db, [
+            R(1, URL_A, "weird"),
+            R(2, URL_A, "success", 200, "ok"),
+        ])
+        self.assertStreakThreshold(
+            run_streak(db, URL_A, "--threshold", "1"),
+            URL_A, 2, 0, 1, False)
+
+    def test_threshold_with_db_errors_still_rejected(self):
+        # 目录路径、非 SQLite、缺列：合法阈值不改变退出码 2 与空 stdout
+        dirdb = self.tmp
+        self.assertRejected(
+            run_streak(dirdb, URL_A, "--threshold", "1"))
+
+        garbage = self.tmp / "g.db"
+        garbage.write_bytes(b"not a sqlite database\n")
+        self.assertRejected(
+            run_streak(garbage, URL_A, "--threshold", "1"))
+
+        badcols = self.tmp / "badcols.db"
+        conn = sqlite3.connect(str(badcols))
+        conn.execute("CREATE TABLE checks (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO checks VALUES (1)")
+        conn.commit()
+        conn.close()
+        proc = run_streak(badcols, URL_A, "--threshold", "1")
+        self.assertRejected(proc)
+        self.assertIn("缺少字段", proc.stderr)
+
+    def test_threshold_with_invalid_url_rejected(self):
+        db = self.tmp / "m.sqlite"
+        build_db(db, [R(1, URL_A, "failure")])
+        proc = run_streak(db, "http://localhost:8765/h",
+                          "--threshold", "1")
+        self.assertRejected(proc)
+
+    def test_omitted_threshold_keeps_three_fields(self):
+        db = self.tmp / "m.sqlite"
+        build_db(db, [R(1, URL_A, "failure", None, "timeout")])
+        proc = run_streak(db, URL_A)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(
+            set(payload),
+            {"url", "latest_id", "consecutive_failures"})
+        self.assertNotIn("threshold", payload)
+        self.assertNotIn("threshold_reached", payload)
+
+    def test_threshold_query_is_readonly(self):
+        db = self.tmp / "m.sqlite"
+        build_db(db, [R(1, URL_A, "failure", None, "timeout")])
+        before = snapshot(self.tmp, db)
+        run_streak(db, URL_A, "--threshold", "1")
+        self.assertEqual(snapshot(self.tmp, db), before)
+        self.assertEqual(
+            {p.name for p in self.tmp.iterdir()}, {"m.sqlite"})
 
     # ---- 题目给定验收样例 ----
 

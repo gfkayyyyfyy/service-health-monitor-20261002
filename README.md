@@ -16,11 +16,11 @@
 
 记录字段：递增 `id`、原始 `url`、UTC 时间（ISO 8601）`checked_at`、非负整数毫秒耗时 `elapsed_ms`、`status`（`success`/`failure`）、`http_status`（收到响应时为状态码，否则 `null`）、`reason`（`ok` / `http_status` / `connection_error` / `timeout`）。
 
-退出码：成功 `0`；已记录的探测失败 `1`；非法 URL、参数不合法、数据库无法打开或读写失败 `2`（标准输出为空，说明写入标准错误；无效输入不发请求、不新增记录；探测前数据库不可用也不发请求）。`recent` 与 `streak` 在路径是目录、文件不是有效 SQLite 数据库、读取权限不足、或历史表（含 `CHECKS`/`Checks` 等大小写异写）缺少查询所需字段时同样以 `2` 结束（标准输出为空、标准错误说明原因），不尝试修复、重建或覆盖文件；`streak` 在连续段中遇到 `success`/`failure` 之外的 `status` 取值时也以 `2` 结束并指出记录 `id`。
+退出码：成功 `0`；已记录的探测失败 `1`；非法 URL、参数不合法、数据库无法打开或读写失败 `2`（标准输出为空，说明写入标准错误；无效输入不发请求、不新增记录；探测前数据库不可用也不发请求）。`recent` 与 `streak` 在路径是目录、文件不是有效 SQLite 数据库、读取权限不足、或历史表（含 `CHECKS`/`Checks` 等大小写异写）缺少查询所需字段时同样以 `2` 结束（标准输出为空、标准错误说明原因），不尝试修复、重建或覆盖文件；`streak` 在连续段中遇到 `success`/`failure` 之外的 `status` 取值时也以 `2` 结束并指出记录 `id`（即使已达到 `--threshold` 也照样拒绝）。`streak --threshold` 缺值、空值、零、负数、小数、空白或其他字符（只接受 ASCII 十进制数字且大于零，允许前导零）同样以 `2` 在访问数据库前拒绝（标准输出为空、标准错误指出 `threshold` 及原因）；阈值判断本身两种结果都以 `0` 结束。
 
-数据库文件不存在时 `check` 可创建（父目录必须已存在）；`recent` 对不存在的路径（即使父目录也不存在，且不会创建任何文件或目录）、空数据库、没有历史表（包括仅有其他表）的数据库以及历史表存在但无记录的情况均输出 `[]`，库中已有的表与数据保持不变。`streak` 对这些无历史情形（含该目标无匹配记录）输出 `{"url":<输入原文>,"latest_id":null,"consecutive_failures":0}`，同样不创建任何文件、目录或表。
+数据库文件不存在时 `check` 可创建（父目录必须已存在）；`recent` 对不存在的路径（即使父目录也不存在，且不会创建任何文件或目录）、空数据库、没有历史表（包括仅有其他表）的数据库以及历史表存在但无记录的情况均输出 `[]`，库中已有的表与数据保持不变。`streak` 对这些无历史情形（含该目标无匹配记录）省略 `--threshold` 时输出 `{"url":<输入原文>,"latest_id":null,"consecutive_failures":0}`；提供阈值时追加 `"threshold":<整数>` 与 `"threshold_reached":false`，同样不创建任何文件、目录或表，也不保存规则或生成事件。
 
-参数：`--timeout` 默认 `1`，须为有限正数秒；`--limit` 默认 `5`，须为正整数。
+参数：`--timeout` 默认 `1`，须为有限正数秒；`--limit` 默认 `5`，须为正整数；`streak --threshold` 可选，须为 ASCII 十进制正整数文本（允许前导零，输出按整数表示），省略时不做阈值判断、保持三字段输出。
 
 ## 本地使用示例
 
@@ -50,6 +50,12 @@ python3 healthcheck.py --db monitor.sqlite recent
 python3 healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/
 # {"url":"http://127.0.0.1:8765/","latest_id":2,"consecutive_failures":1}
 # 退出码 0；该目标尚无记录时 latest_id 为 null、consecutive_failures 为 0
+
+# 同一次查询内附带阈值判断：次数 >= 阈值时 threshold_reached 为 true
+python3 healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/ --threshold 2
+# {"url":"http://127.0.0.1:8765/","latest_id":2,"consecutive_failures":1,"threshold":2,"threshold_reached":false}
+# --threshold 只接受 ASCII 十进制正整数（允许前导零，按整数输出）；省略时仍为上面的三字段输出；
+# 判断只读、不保存规则、不生成事件，两种结果均以退出码 0 结束
 ```
 
 路径与查询参数同样允许，例如：
