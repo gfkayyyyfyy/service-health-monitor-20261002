@@ -12,6 +12,7 @@
     python healthcheck.py --db monitor.sqlite recent --since 2026-10-04T00:00:01Z --until 2026-10-04T00:00:02.000000+00:00 --limit 2
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status failure --reason timeout --limit 2
     python healthcheck.py --db monitor.sqlite recent --status-summary --limit 2
+    python healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/health
 """
 
 import argparse
@@ -712,6 +713,111 @@ def command_recent(args):
     return 0
 
 
+def render_streak_result(url, latest_id, consecutive_failures):
+    """streak 的唯一呈现入口：单行紧凑 JSON，仅含三个字段（字段顺序固定）。
+
+    url 为命令行输入的原始字符串（不做任何归一化）；无匹配记录、缺库、
+    空库、无历史表等空结果情形同样经此入口（latest_id 为 None，
+    consecutive_failures 为 0），不再单独维护空结果的输出分支。
+    """
+    payload = {
+        "url": url,
+        "latest_id": latest_id,
+        "consecutive_failures": consecutive_failures,
+    }
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+
+
+def command_streak(args):
+    """只读查询指定目标的连续失败次数，不发网络请求、不修改任何数据。
+
+    连续段按同一原始 URL 的记录以 id 倒序定义（checked_at 不参与排序）：
+    从该目标最大 id 起累计 failure 直到首条 success；最新为 success 时
+    为零，全是 failure 时统计全部。只按保存的 status 判断，其他目标及
+    reason、http_status 不影响连续段；统计不受 recent 的 limit 限制。
+    """
+    # 先校验 URL（沿用 check 的本机 URL 规则）：非法值在任何数据库访问
+    # 之前即以退出码 2 拒绝（stdout 为空，stderr 说明原因）
+    validate_target_url(args.url)
+    db_path = args.db
+
+    # streak 严格只读：文件尚不存在（含父目录不存在）时历史为空，
+    # 不创建文件、不创建目录、不创建表
+    if not os.path.exists(db_path):
+        render_streak_result(args.url, None, 0)
+        return 0
+
+    # 路径指向目录不是有效的数据库文件
+    if os.path.isdir(db_path):
+        die(f"读取数据库 {db_path!r} 失败: 路径是一个目录，不是 SQLite 数据库文件")
+
+    # 以只读模式打开：可读但不可写的文件也能查询，
+    # 且任何情况下都不会创建或修改文件（含 -wal/-journal）
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        die(f"读取数据库 {db_path!r} 失败: {exc}")
+
+    try:
+        try:
+            # 只查询，绝不执行 CREATE TABLE / INSERT 等写操作
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            ]
+            # 历史表名按大小写不敏感识别（同 recent）：CHECKS、Checks 等与
+            # checks 是同一历史表，查询时使用库中保存的实际表名
+            checks_table = next(
+                (name for name in tables if name.lower() == "checks"), None
+            )
+            if checks_table is None:
+                # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
+                latest_id = None
+                consecutive_failures = 0
+            else:
+                # 表存在但缺任一所需字段：以退出码 2 说明缺列，
+                # 不再误判为空历史
+                ensure_checks_columns(conn)
+                quoted = '"' + checks_table.replace('"', '""') + '"'
+                # 只取该目标的 id 与 status，按 id 倒序取出全部记录：
+                # 连续段统计不设条数上限（不受 recent 默认五条限制）
+                rows = conn.execute(
+                    f"SELECT id, status FROM {quoted} "
+                    "WHERE url = ? ORDER BY id DESC",
+                    (args.url,),
+                ).fetchall()
+                if not rows:
+                    latest_id = None
+                    consecutive_failures = 0
+                else:
+                    latest_id = rows[0][0]
+                    consecutive_failures = 0
+                    for row_id, status in rows:
+                        if status == STATUS_FAILURE:
+                            consecutive_failures += 1
+                        elif status == STATUS_SUCCESS:
+                            break
+                        else:
+                            # 连续段判断中遇到其他 status 值：以退出码 2
+                            # 拒绝并指出记录 id（stdout 为空，不修改数据）
+                            die(
+                                f"记录 id={row_id} 的 status 不是 "
+                                f"'success' 或 'failure': {status!r}"
+                            )
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        # 文件不是有效 SQLite 数据库、读取失败等
+        # （checks 表缺字段已在查询前由 ensure_checks_columns 单独报告）
+        die(f"读取数据库 {db_path!r} 失败: {exc}")
+
+    render_streak_result(args.url, latest_id, consecutive_failures)
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="healthcheck.py",
@@ -802,6 +908,17 @@ def build_parser():
              "只依据保存的 status 字段分类）。与 --summary 互斥",
     )
     p_recent.set_defaults(handler=command_recent)
+
+    p_streak = subparsers.add_parser(
+        "streak", help="只读查询指定目标的连续失败次数"
+    )
+    p_streak.add_argument(
+        "--url",
+        required=True,
+        help="查询目标（规则同 check：仅 http://127.0.0.1:端口/...），"
+             "按数据库保存的原始 url 字符串精确匹配",
+    )
+    p_streak.set_defaults(handler=command_streak)
 
     return parser
 
