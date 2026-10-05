@@ -222,8 +222,8 @@ status → URL → reason → since → until（含窗口次序）→ 数据库�
 
 6. **数据库路径不存在 → 视为空历史**（`healthcheck.py:589-594`）。
    `os.path.exists` 为假时（文件不存在，**连父目录一起不存在也相同**），
-   普通查询输出 `[]`，摘要输出常量 `NULL_SUMMARY_JSON`
-   （`healthcheck.py:129-132`），退出码 `0`。此分支不打开 sqlite，不创建
+   以空记录集调用与正常查询相同的呈现入口 `render_recent_result`：
+   普通查询输出 `[]`，摘要输出 count 0 且三个耗时字段为 null，退出码 `0`。此分支不打开 sqlite，不创建
    任何东西——即使给了合法 `--since`/`--until` 也一样。
 
 7. **路径是目录 → 错误**（`healthcheck.py:597-598`）。
@@ -387,9 +387,9 @@ python healthcheck.py --db monitor.sqlite recent \
   而非 `3`；max 为 7（id 6）。
 
 无记录时（缺库、无历史表、空表、筛选无匹配——含时间窗口过滤后无保留），
-摘要为 `count: 0` 且三个耗时字段为 `null`：缺库快路径输出常量
-`NULL_SUMMARY_JSON`（`healthcheck.py:129-132`），其余路径构造等价对象
-（`healthcheck.py:672-681`），退出码均为 `0`。
+摘要为 `count: 0` 且三个耗时字段为 `null`：缺库快路径与其余路径都以空
+记录集走同一呈现入口 `render_recent_result`（由 `build_elapsed_summary`
+构造空摘要），输出逐字节一致，退出码均为 `0`。
 
 ---
 
@@ -1083,7 +1083,7 @@ until 与目录/缺库错误报告，且此时数据库尚未被访问——见�
 | status 条件：按记录 status 等值匹配（不看 reason） | `status = ?` 条件片段 | `122-126` |
 | reason 条件：按保存的 reason 精确匹配（不看 status/http_status） | `reason = ?` 条件片段 | `122-126` |
 | 摘要统计同条件最终记录子集；失败与零耗时计入；均值不取整 | 摘要分支 | `659-682` |
-| 空摘要固定输出（count 0、三个 null） | `NULL_SUMMARY_JSON` | `129-132` |
+| 空摘要固定输出（count 0、三个 null） | `render_recent_result` / `build_elapsed_summary`（空记录集） | 呈现入口与摘要构造 |
 | 完整七字段记录数组 / `[]` 输出（checked_at 原样保留） | 记录映射与 JSON 输出 | `684-696` |
 | 错误统一出口（退出码 2、stderr、stdout 空） | `die` | `135-138` |
 | 网络探测与建库/写入仅属于 check（recent 不触碰；check 不接受 --until） | `probe_once` / `open_database` / `INSERT_SQL` | `443-467` / `392-408` / `95-98` |

@@ -126,18 +126,6 @@ RECENT_FILTER_CLAUSES = (
     ("reason", "reason = ?"),
 )
 
-# 无记录时的摘要输出（count 为 0、耗时字段为 null）
-NULL_SUMMARY_JSON = (
-    '{"count":0,"min_elapsed_ms":null,'
-    '"max_elapsed_ms":null,"avg_elapsed_ms":null}'
-)
-
-# 无记录时的状态摘要输出（三个计数均为 0）
-NULL_STATUS_SUMMARY_JSON = (
-    '{"count":0,"success_count":0,"failure_count":0}'
-)
-
-
 def die(message):
     """参数或数据库错误：写 stderr，以退出码 2 结束（stdout 保持为空）。"""
     print(f"healthcheck: error: {message}", file=sys.stderr)
@@ -549,6 +537,78 @@ def build_recent_query(quoted_table, filters, sql_limit=True):
     return sql, params
 
 
+def row_to_record(row):
+    """把一行查询结果映射为输出的七字段记录对象（字段名与顺序固定）。
+
+    url、checked_at 等字符串原样取自数据库，不做任何归一化。
+    """
+    return {
+        "id": row[0],
+        "url": row[1],
+        "checked_at": row[2],
+        "elapsed_ms": row[3],
+        "status": row[4],
+        "http_status": row[5],
+        "reason": row[6],
+    }
+
+
+def build_elapsed_summary(rows):
+    """耗时摘要：统计给定记录集的 elapsed_ms，失败与零耗时记录均计入，
+    平均值不取整（浮点除法原样输出）；空集 count 为 0、三个耗时值为 None
+    （JSON null）。
+    """
+    elapsed_values = [row[3] for row in rows]
+    if not elapsed_values:
+        return {
+            "count": 0,
+            "min_elapsed_ms": None,
+            "max_elapsed_ms": None,
+            "avg_elapsed_ms": None,
+        }
+    count = len(elapsed_values)
+    return {
+        "count": count,
+        "min_elapsed_ms": min(elapsed_values),
+        "max_elapsed_ms": max(elapsed_values),
+        "avg_elapsed_ms": sum(elapsed_values) / count,
+    }
+
+
+def build_status_summary(rows):
+    """状态摘要：只按记录保存的 status 字段分类计数，绝不从 reason 或
+    http_status 推断；空集三个计数均为 0。
+    """
+    return {
+        "count": len(rows),
+        "success_count": sum(
+            1 for row in rows if row[4] == STATUS_SUCCESS
+        ),
+        "failure_count": sum(
+            1 for row in rows if row[4] == STATUS_FAILURE
+        ),
+    }
+
+
+def render_recent_result(rows, summary, status_summary):
+    """recent 三种输出形态的唯一呈现入口。
+
+    rows 为筛选、时间窗口与 limit 处理后的同一批记录（已按 id 倒序）；
+    缺库、无历史表、空表、筛选无匹配等空结果情形同样经此入口（传空
+    列表），不再单独维护空结果的输出分支。普通模式输出七字段记录数组
+    （空集为 []），summary 为真输出耗时摘要，status_summary 为真输出
+    状态摘要；均为紧凑单行 JSON 加一个换行。summary 与 status_summary
+    的互斥在参数校验阶段已保证，此处不重复检查。
+    """
+    if summary:
+        payload = build_elapsed_summary(rows)
+    elif status_summary:
+        payload = build_status_summary(rows)
+    else:
+        payload = [row_to_record(row) for row in rows]
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+
+
 def command_recent(args):
     db_path = args.db
 
@@ -599,14 +659,10 @@ def command_recent(args):
     time_filter_active = since_filter is not None or until_filter is not None
 
     # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
-    # 不创建文件、不创建目录、不发任何网络请求
+    # 不创建文件、不创建目录、不发任何网络请求；空结果与查询后的
+    # 空结果共用同一呈现入口
     if not os.path.exists(db_path):
-        if args.summary:
-            print(NULL_SUMMARY_JSON)
-        elif args.status_summary:
-            print(NULL_STATUS_SUMMARY_JSON)
-        else:
-            print("[]")
+        render_recent_result([], args.summary, args.status_summary)
         return 0
 
     # 路径指向目录不是有效的数据库文件
@@ -672,67 +728,12 @@ def command_recent(args):
         # （checks 表缺字段已在查询前由 ensure_checks_columns 单独报告）
         die(f"读取数据库 {db_path!r} 失败: {exc}")
 
-    if args.summary:
-        # 摘要模式：对 recent 本会返回的同一批记录（同样的 URL 精确筛选、
-        # id 倒序、limit 截取）统计耗时，成功与失败记录、零耗时均计入。
-        elapsed_values = [row[3] for row in rows]
-        if elapsed_values:
-            count = len(elapsed_values)
-            summary = {
-                "count": count,
-                "min_elapsed_ms": min(elapsed_values),
-                "max_elapsed_ms": max(elapsed_values),
-                # 平均值不取整，以 JSON 数字原样输出
-                "avg_elapsed_ms": sum(elapsed_values) / count,
-            }
-        else:
-            # 无记录（含数据库不存在、无 checks 表、筛选无匹配）：
-            # count 为 0，耗时字段为 null，退出码仍为 0
-            summary = {
-                "count": 0,
-                "min_elapsed_ms": None,
-                "max_elapsed_ms": None,
-                "avg_elapsed_ms": None,
-            }
-        print(json.dumps(summary, separators=(",", ":"), ensure_ascii=False))
-        return 0
-
-    if args.status_summary:
-        # 状态摘要模式：对 recent 本会返回的同一批记录（同样的筛选、
-        # id 倒序、limit 截取）按保存的 status 字段计数；只依据 status，
-        # 绝不从 reason 或 http_status 推断，零耗时与各种失败原因的记录
-        # 均参与计数。无记录（含数据库不存在、无 checks 表、筛选无匹配）
-        # 时三个计数均为 0，退出码仍为 0
-        success_count = sum(
-            1 for row in rows if row[4] == STATUS_SUCCESS
-        )
-        failure_count = sum(
-            1 for row in rows if row[4] == STATUS_FAILURE
-        )
-        status_summary = {
-            "count": len(rows),
-            "success_count": success_count,
-            "failure_count": failure_count,
-        }
-        print(
-            json.dumps(status_summary, separators=(",", ":"),
-                       ensure_ascii=False)
-        )
-        return 0
-
-    records = [
-        {
-            "id": row[0],
-            "url": row[1],
-            "checked_at": row[2],
-            "elapsed_ms": row[3],
-            "status": row[4],
-            "http_status": row[5],
-            "reason": row[6],
-        }
-        for row in rows
-    ]
-    print(json.dumps(records, separators=(",", ":"), ensure_ascii=False))
+    # 三种形态共用同一呈现入口：rows 即筛选、时间窗口与 limit 处理后的
+    # 同一批记录；--summary 输出其耗时摘要（失败与零耗时计入，均值不取整），
+    # --status-summary 输出其状态计数（只依据保存的 status 字段），
+    # 普通模式输出七字段记录数组；无记录时分别为 count 0 三 null、
+    # 三个计数为 0、[]
+    render_recent_result(rows, args.summary, args.status_summary)
     return 0
 
 
