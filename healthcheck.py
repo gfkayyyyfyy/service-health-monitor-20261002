@@ -12,6 +12,7 @@
     python healthcheck.py --db monitor.sqlite recent --since 2026-10-04T00:00:01Z --until 2026-10-04T00:00:02.000000+00:00 --limit 2
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status failure --reason timeout --limit 2
     python healthcheck.py --db monitor.sqlite recent --status-summary --limit 2
+    python healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/health
 """
 
 import argparse
@@ -122,6 +123,18 @@ RECENT_FILTER_CLAUSES = (
     ("status", "status = ?"),
     ("reason", "reason = ?"),
 )
+
+# streak 的唯一查询模板：取指定目标按 id 倒序排列的 (id, status) 两列。
+# 连续失败段只以 id 大小定义先后（checked_at 不参与排序），且不受 recent
+# 默认五条限制，故不带 LIMIT；连续段在 Python 侧自最大 id 起逐条判定，
+# 遇到首条 success 即停止。status 若出现 success/failure 之外的取值，
+# 由调用方按记录 id 以退出码 2 拒绝。
+STREAK_SQL = """
+SELECT id, status
+FROM {table}
+WHERE url = ?
+ORDER BY id DESC
+"""
 
 def die(message):
     """参数或数据库错误：写 stderr，以退出码 2 结束（stdout 保持为空）。"""
@@ -393,6 +406,47 @@ def ensure_checks_columns(conn):
         die("checks 表缺少字段: " + ", ".join(missing))
 
 
+def quote_identifier(name):
+    """把表名等 SQLite 标识符加双引号引用，内部双引号按 SQL 规则翻倍。"""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def open_history_db_readonly(db_path):
+    """以严格只读方式打开历史数据库，供 recent / streak 查询共用。
+
+    路径（含父目录）尚不存在时返回 None，表示历史为空：不创建文件、目录，
+    也不产生 -wal/-journal 旁路文件。路径指向目录、文件不是有效 SQLite
+    数据库或无读权限等打开/读取失败，均以退出码 2 结束（stdout 为空，
+    stderr 说明原因）。可读但不可写的文件可正常打开查询。
+    """
+    if not os.path.exists(db_path):
+        return None
+    if os.path.isdir(db_path):
+        die(f"读取数据库 {db_path!r} 失败: 路径是一个目录，不是 SQLite 数据库文件")
+    # 以只读模式打开：可读但不可写的文件也能查询，
+    # 且任何情况下都不会创建或修改文件（含 -wal/-journal）
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        return sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        die(f"读取数据库 {db_path!r} 失败: {exc}")
+
+
+def resolve_checks_table(conn):
+    """在只读连接上按大小写不敏感查找历史表。
+
+    返回库中保存的实际表名（CHECKS / Checks / checks 视为同一历史表，
+    这类异写表至多存在一个）；空库或仅有其他表时返回 None。
+    """
+    tables = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    ]
+    return next((name for name in tables if name.lower() == "checks"), None)
+
+
 def encode_request_target(target):
     """把请求目标中的非 ASCII 字符按 UTF-8 字节转成大写十六进制百分号编码。
 
@@ -633,40 +687,21 @@ def command_recent(args):
     # 任一时间边界生效时，时间比较都在 Python 侧完成
     time_filter_active = since_filter is not None or until_filter is not None
 
-    # recent 严格只读：文件尚不存在（含父目录不存在）时历史为空，
+    # 严格只读：文件尚不存在（含父目录不存在）时历史为空，
     # 不创建文件、不创建目录、不发任何网络请求；空结果与查询后的
     # 空结果共用同一呈现入口
-    if not os.path.exists(db_path):
+    conn = open_history_db_readonly(db_path)
+    if conn is None:
         render_recent_result([], args.summary, args.status_summary)
         return 0
-
-    # 路径指向目录不是有效的数据库文件
-    if os.path.isdir(db_path):
-        die(f"读取数据库 {db_path!r} 失败: 路径是一个目录，不是 SQLite 数据库文件")
-
-    # 以只读模式打开：可读但不可写的文件也能查询，
-    # 且任何情况下都不会创建或修改文件（含 -wal/-journal）
-    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as exc:
-        die(f"读取数据库 {db_path!r} 失败: {exc}")
 
     try:
         try:
             # 只查询，绝不执行 CREATE TABLE / INSERT 等写操作
-            tables = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            ]
             # 历史表名按大小写不敏感识别：CHECKS、Checks 等与 checks 是同一
             # 历史表（SQLite 标识符本身大小写不敏感，这类异写表至多存在一个），
             # 查询时使用库中保存的实际表名
-            checks_table = next(
-                (name for name in tables if name.lower() == "checks"), None
-            )
+            checks_table = resolve_checks_table(conn)
             if checks_table is None:
                 # 空数据库或仅有其他表：历史为空，原有表与数据保持不变
                 rows = []
@@ -674,7 +709,7 @@ def command_recent(args):
                 # 表存在但缺任一所需字段：以退出码 2 说明缺列，
                 # 不再误判为空历史
                 ensure_checks_columns(conn)
-                quoted = '"' + checks_table.replace('"', '""') + '"'
+                quoted = quote_identifier(checks_table)
                 # 三个可选筛选共八种组合，统一由 build_recent_query 组装：
                 # 条件之间一律 AND，先按全部条件筛选，再按 id 倒序排列。
                 # 任一时间边界生效时 SQL 不加 LIMIT：时间条件在 Python 侧
@@ -709,6 +744,90 @@ def command_recent(args):
     # 普通模式输出七字段记录数组；无记录时分别为 count 0 三 null、
     # 三个计数为 0、[]
     render_recent_result(rows, args.summary, args.status_summary)
+    return 0
+
+
+def count_consecutive_failures(rows):
+    """按 id 倒序的 (id, status) 行序列计算连续失败次数。
+
+    rows 已按 id 从大到小排列且同属一个目标；自最大 id 起累计 failure，
+    遇到首条 success 即停止，最新为 success 时为 0、全部 failure 时统计
+    全部。只按保存的 status 判断，http_status、reason 不参与。若遇到
+    success/failure 之外的 status 取值，经 die 以退出码 2 拒绝并指出记录
+    id（不修改任何数据）。
+    """
+    count = 0
+    for record_id, status in rows:
+        if status == STATUS_FAILURE:
+            count += 1
+        elif status == STATUS_SUCCESS:
+            break
+        else:
+            die(
+                f"记录 id={record_id} 的 status 不是受支持的取值 "
+                f"（仅 'success' 或 'failure'）: {status!r}"
+            )
+    return count
+
+
+def render_streak_result(url, latest_id, consecutive_failures):
+    """streak 唯一输出形态：紧凑单行 JSON，字段名与顺序固定。
+
+    url 保留命令行输入原文，不做任何规范化。
+    """
+    payload = {
+        "url": url,
+        "latest_id": latest_id,
+        "consecutive_failures": consecutive_failures,
+    }
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+
+
+def command_streak(args):
+    # 先校验目标 URL（沿用 check 的本机地址规则），非法地址在访问数据库前
+    # 即以退出码 2 拒绝。校验通过即可，匹配仍使用原始字符串，不做规范化。
+    validate_target_url(args.url)
+
+    # streak 严格只读：文件尚不存在（含父目录不存在）、空库、无历史表或
+    # 该目标无记录时返回 latest_id 为 null、consecutive_failures 为 0，
+    # 不创建文件、目录或表，不发任何网络请求
+    conn = open_history_db_readonly(args.db)
+    if conn is None:
+        render_streak_result(args.url, None, 0)
+        return 0
+
+    try:
+        try:
+            # 历史表名按大小写不敏感识别（与 recent 相同的兼容范围），
+            # 查询时使用库中保存的实际表名
+            checks_table = resolve_checks_table(conn)
+            if checks_table is None:
+                # 空数据库或仅有其他表：该目标无记录，原有表与数据不变
+                latest_id = None
+                consecutive_failures = 0
+            else:
+                # 表存在但缺任一既有必需字段：以退出码 2 说明缺列
+                ensure_checks_columns(conn)
+                quoted = quote_identifier(checks_table)
+                # 只取该目标的 (id, status)，按 id 倒序、不加 LIMIT：
+                # 连续段不受 recent 默认五条限制，checked_at 不参与排序
+                rows = conn.execute(
+                    STREAK_SQL.format(table=quoted), (args.url,)
+                ).fetchall()
+                if not rows:
+                    latest_id = None
+                    consecutive_failures = 0
+                else:
+                    latest_id = rows[0][0]
+                    consecutive_failures = count_consecutive_failures(rows)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        # 文件不是有效 SQLite 数据库、读取失败等
+        # （checks 表缺字段已在查询前由 ensure_checks_columns 单独报告）
+        die(f"读取数据库 {args.db!r} 失败: {exc}")
+
+    render_streak_result(args.url, latest_id, consecutive_failures)
     return 0
 
 
@@ -802,6 +921,20 @@ def build_parser():
              "只依据保存的 status 字段分类）。与 --summary 互斥",
     )
     p_recent.set_defaults(handler=command_recent)
+
+    p_streak = subparsers.add_parser(
+        "streak",
+        help="查询指定目标自最大 id 起的连续失败次数（只读，单条 JSON）",
+    )
+    p_streak.add_argument(
+        "--url",
+        required=True,
+        help="必填：目标 URL，按数据库保存的原始 url 字符串精确匹配"
+             "（规则同 check：仅 http://127.0.0.1:端口/...）；"
+             "连续段只按 id 倒序的保存 status 判定，不支持 recent 的"
+             "筛选与限量选项",
+    )
+    p_streak.set_defaults(handler=command_streak)
 
     return parser
 
