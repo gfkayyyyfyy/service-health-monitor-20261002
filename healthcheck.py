@@ -59,13 +59,14 @@ REASON_FILTER_CHOICES = (
     REASON_TIMEOUT,
 )
 
-# 裸 --since（命令行上未给值）时 argparse 注入的哨兵；
-# 区别于「完全省略该参数」的 None（None 表示不按起始时间筛选）
-SINCE_FILTER_MISSING = object()
+# 裸 --since / --until（命令行上未给值）时 argparse 注入的同一个哨兵；
+# 区别于「完全省略该参数」的 None（None 表示该侧不设时间边界）
+TIME_BOUND_MISSING = object()
 
-# 裸 --until（命令行上未给值）时 argparse 注入的哨兵；
-# 区别于「完全省略该参数」的 None（None 表示不按结束时间筛选）
-UNTIL_FILTER_MISSING = object()
+# 缺值错误信息中回显的格式要求（--since 与 --until 完全一致）
+TIME_BOUND_FORMAT_HINT = (
+    "YYYY-MM-DDTHH:MM:SS（秒后可带一至六位小数）并以 Z 或 +00:00 结尾"
+)
 
 # --since 与记录 checked_at 共用的严格 UTC 格式：
 # YYYY-MM-DDTHH:MM:SS，秒后可带一至六位小数，仅以 Z 或 +00:00 结尾；
@@ -253,50 +254,30 @@ def utc_timestamp_format_problem(value):
     )
 
 
-def validate_since_filter(value):
-    """--since 只接受 YYYY-MM-DDTHH:MM:SS[.1-6位小数](Z|+00:00) 且日期时间
-    真实存在；None 表示不筛选。
+def validate_time_bound(value, name):
+    """--since / --until 共用的唯一校验入口。
 
-    缺值（裸 --since）、空值、前后空白、缺时区、非 UTC 偏移、非法日期时间
-    均经 die 以退出码 2 拒绝（stderr 指出 --since 及原因，stdout 为空）。
-    此检查在 status、URL、reason 都合法之后、一切数据库访问之前执行，
-    拒绝时不会读取数据库。返回值用于与记录的 checked_at 按时刻比较。
+    name 为 "since" 或 "until"，只用于错误信息中的参数名称。None 表示该侧
+    边界省略（不设边界），原样返回 None；其余取值只接受
+    YYYY-MM-DDTHH:MM:SS[.1-6位小数](Z|+00:00) 且日期时间真实存在，合法时
+    返回用于与记录 checked_at 按时刻比较的 UTC aware datetime。
+
+    缺值（裸参数）、空值、前后空白、缺时区、非 UTC 偏移、七位小数、非法
+    日期时间均经 die 以退出码 2 拒绝（stderr 指出对应参数名及原因，stdout
+    为空）。两侧规则、错误通道与文案完全一致，调用方负责保证 --since 先于
+    --until 校验，故两边界同时非法时先报告 --since；该校验发生在一切数据库
+    访问之前，拒绝时不会读取数据库。
     """
     if value is None:
         return None
-    if value is SINCE_FILTER_MISSING:
+    if value is TIME_BOUND_MISSING:
         die(
-            "since 参数错误：--since 必须提供值，格式为 "
-            "YYYY-MM-DDTHH:MM:SS（秒后可带一至六位小数）"
-            "并以 Z 或 +00:00 结尾，实际缺少值"
+            f"{name} 参数错误：--{name} 必须提供值，格式为 "
+            f"{TIME_BOUND_FORMAT_HINT}，实际缺少值"
         )
     problem = utc_timestamp_format_problem(value)
     if problem is not None:
-        die(f"since 参数错误：--since {problem}，实际值 {value!r}")
-    return parse_utc_timestamp(value)
-
-
-def validate_until_filter(value):
-    """--until 只接受 YYYY-MM-DDTHH:MM:SS[.1-6位小数](Z|+00:00) 且日期时间
-    真实存在；None 表示不筛选。
-
-    规则、错误通道与 --since 完全一致：缺值（裸 --until）、空值、前后空白、
-    缺时区、非 UTC 偏移、非法日期时间均经 die 以退出码 2 拒绝（stderr 指出
-    --until 及原因，stdout 为空）。此检查在 --since 之后、一切数据库访问
-    之前执行，拒绝时不会读取数据库。返回值用于与记录的 checked_at 按时刻
-    比较（checked_at 不晚于该时刻即保留）。
-    """
-    if value is None:
-        return None
-    if value is UNTIL_FILTER_MISSING:
-        die(
-            "until 参数错误：--until 必须提供值，格式为 "
-            "YYYY-MM-DDTHH:MM:SS（秒后可带一至六位小数）"
-            "并以 Z 或 +00:00 结尾，实际缺少值"
-        )
-    problem = utc_timestamp_format_problem(value)
-    if problem is not None:
-        die(f"until 参数错误：--until {problem}，实际值 {value!r}")
+        die(f"{name} 参数错误：--{name} {problem}，实际值 {value!r}")
     return parse_utc_timestamp(value)
 
 
@@ -636,14 +617,15 @@ def command_recent(args):
     # 即以退出码 2 拒绝。reason 只按保存值精确匹配，绝不从状态码推断。
     reason_filter = validate_reason_filter(args.reason)
 
-    # status、URL、reason 都合法后再校验 --since（UTC 起始时间）：
+    # status、URL、reason 都合法后再校验时间边界（--since 先于 --until）：
     # 缺值、空值、前后空白、缺时区、非 UTC 偏移、非法日期时间同样在
-    # 读取数据库前即以退出码 2 拒绝。省略时不增加任何时间条件。
-    since_filter = validate_since_filter(args.since)
+    # 读取数据库前即以退出码 2 拒绝；两侧共用 validate_time_bound 的同一
+    # 套规则与错误封装。省略时该侧不增加任何时间条件。
+    since_filter = validate_time_bound(args.since, "since")
 
-    # --since 之后再校验 --until（UTC 结束时间），规则与错误通道同 --since：
+    # --since 之后再校验 --until（UTC 结束时间）：
     # 省略时不设上界；与 --since 同用时起点不得晚于终点（相等合法）。
-    until_filter = validate_until_filter(args.until)
+    until_filter = validate_time_bound(args.until, "until")
     if (
         since_filter is not None
         and until_filter is not None
@@ -786,7 +768,7 @@ def build_parser():
     p_recent.add_argument(
         "--since",
         nargs="?",
-        const=SINCE_FILTER_MISSING,
+        const=TIME_BOUND_MISSING,
         default=None,
         metavar="YYYY-MM-DDTHH:MM:SS[.ffffff](Z|+00:00)",
         help="可选：仅返回 checked_at 不早于该 UTC 时刻的记录，格式为 "
@@ -798,7 +780,7 @@ def build_parser():
     p_recent.add_argument(
         "--until",
         nargs="?",
-        const=UNTIL_FILTER_MISSING,
+        const=TIME_BOUND_MISSING,
         default=None,
         metavar="YYYY-MM-DDTHH:MM:SS[.ffffff](Z|+00:00)",
         help="可选：仅返回 checked_at 不晚于该 UTC 时刻的记录（<=，相等命中），"
