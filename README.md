@@ -10,15 +10,15 @@
 
 - `check`：对**登记的单个 URL** 发送**一次** `GET`（不跟随重定向），将结果以一行 JSON 输出到标准输出并持久化到 SQLite；
 - `recent`：**只读**查询历史，按 `id` 倒序输出 JSON 数组；不新增表或记录、不创建数据库文件或目录，也不发起任何网络请求（数据库可读但不可写时同样可查询）。历史表名按大小写不敏感识别：`CHECKS`、`Checks` 等与 `checks` 是同一历史表，查询结果完全相同。可选 `--url` 仅返回指定目标的记录：按数据库保存的原始 `url` 字符串**精确匹配**，不合并路径或查询参数不同的地址，也不规范化 URL；未提供时返回全部目标的记录。筛选值沿用 `check` 的本机 URL 规则，非法地址以退出码 `2` 结束，且优先于数据库路径错误报告。可选 `--status` 仅返回指定状态的记录，只接受区分大小写的 `success` 或 `failure`（其他值、空字符串或缺少值均为参数错误，退出码 `2`，在读取数据库前拒绝）；省略时查询全部状态。可选 `--reason` 仅返回保存的 `reason` 与之精确相等的记录，只接受区分大小写的 `ok`、`http_status`、`connection_error`、`timeout`（其他值、大小写变体、前后空白、空字符串或缺少值均为参数错误，退出码 `2`，在 status、URL 均合法之后、读取数据库之前拒绝）；只按保存值匹配、不从状态码推断，省略时查询全部原因。三个筛选同用时各条件取交集；查询先按全部条件筛选，再按 `id` 倒序取 `--limit` 条（默认 5）。
-- `streak`：**只读**查询指定目标的连续失败次数，输出一行仅含 `url`、`latest_id`、`consecutive_failures` 的 JSON。`--url` 必填（沿用 `check` 的本机 URL 规则，非法地址在访问数据库前以退出码 `2` 拒绝），按数据库保存的原始 `url` 字符串精确匹配；同一目标的记录按 `id` 倒序定义连续段（`checked_at` 不参与排序），自最大 `id` 起累计 `failure` 直到首条 `success`：最新为 `success` 时为 `0`，全部为 `failure` 时统计全部；只按保存的 `status` 判断，其他目标及 `reason`、`http_status` 不影响连续段，统计不受 `recent` 默认五条限制，也不接收 `recent` 的筛选与限量选项。无匹配记录、数据库或父目录不存在、空库及无历史表时输出输入 `url`、`latest_id` 为 `null`、`consecutive_failures` 为 `0`，不创建文件、目录或表；历史表大小写异写（`CHECKS`/`Checks`）与可读但不可写的数据库沿用 `recent` 的兼容范围。连续段中若出现其他 `status` 值，以退出码 `2` 拒绝并在标准错误中指出记录 `id`。查询不发网络请求、不修改已有数据。
+- `streak`：**只读**查询指定目标的连续失败次数，默认输出一行仅含 `url`、`latest_id`、`consecutive_failures` 的 JSON。`--url` 必填（沿用 `check` 的本机 URL 规则，非法地址在访问数据库前以退出码 `2` 拒绝），按数据库保存的原始 `url` 字符串精确匹配；同一目标的记录按 `id` 倒序定义连续段（`checked_at` 不参与排序），自最大 `id` 起累计 `failure` 直到首条 `success`：最新为 `success` 时为 `0`，全部为 `failure` 时统计全部；只按保存的 `status` 判断，其他目标及 `reason`、`http_status` 不影响连续段，统计不受 `recent` 默认五条限制，也不接收 `recent` 的筛选与限量选项。可选 `--threshold N` 在同一次查询内附加阈值判断：只接受 ASCII 十进制数字组成且数值大于零的文本（允许前导零，输出按整数表示），缺值、空值、零、负数、小数、空白或其他字符均在访问数据库前以退出码 `2` 拒绝；省略时保留原有三字段输出，提供时追加整数 `threshold` 与布尔 `threshold_reached`（连续失败次数大于或等于阈值为 `true`，否则为 `false`）。两种情况均以退出码 `0` 结束、标准错误为空，本次判断不保存规则也不生成事件；达到阈值仍返回完整次数。无匹配记录、数据库或父目录不存在、空库及无历史表时输出输入 `url`、`latest_id` 为 `null`、`consecutive_failures` 为 `0`（提供阈值时 `threshold_reached` 为 `false`），不创建文件、目录或表；历史表大小写异写（`CHECKS`/`Checks`）与可读但不可写的数据库沿用 `recent` 的兼容范围。连续段中若出现其他 `status` 值，以退出码 `2` 拒绝并在标准错误中指出记录 `id`——即使此前失败次数已达到阈值也拒绝；比首条 `success` 更旧的记录不参与遍历，不影响结果。查询不发网络请求、不修改已有数据。
 
 目标 URL 限制：仅 `http` 协议、主机必须为 `127.0.0.1`、必须显式指定 `1-65535` 端口；允许路径与查询参数；不接受用户信息（userinfo）与片段（fragment）；其余地址一律拒绝。本轮不做服务自动发现，也不含 TCP、定时任务或告警。
 
 记录字段：递增 `id`、原始 `url`、UTC 时间（ISO 8601）`checked_at`、非负整数毫秒耗时 `elapsed_ms`、`status`（`success`/`failure`）、`http_status`（收到响应时为状态码，否则 `null`）、`reason`（`ok` / `http_status` / `connection_error` / `timeout`）。
 
-退出码：成功 `0`；已记录的探测失败 `1`；非法 URL、参数不合法、数据库无法打开或读写失败 `2`（标准输出为空，说明写入标准错误；无效输入不发请求、不新增记录；探测前数据库不可用也不发请求）。`recent` 与 `streak` 在路径是目录、文件不是有效 SQLite 数据库、读取权限不足、或历史表（含 `CHECKS`/`Checks` 等大小写异写）缺少查询所需字段时同样以 `2` 结束（标准输出为空、标准错误说明原因），不尝试修复、重建或覆盖文件；`streak` 在连续段中遇到 `success`/`failure` 之外的 `status` 取值时也以 `2` 结束并指出记录 `id`。
+退出码：成功 `0`；已记录的探测失败 `1`；非法 URL、参数不合法、数据库无法打开或读写失败 `2`（标准输出为空，说明写入标准错误；无效输入不发请求、不新增记录；探测前数据库不可用也不发请求）。`recent` 与 `streak` 在路径是目录、文件不是有效 SQLite 数据库、读取权限不足、或历史表（含 `CHECKS`/`Checks` 等大小写异写）缺少查询所需字段时同样以 `2` 结束（标准输出为空、标准错误说明原因），不尝试修复、重建或覆盖文件；`streak` 在连续段中遇到 `success`/`failure` 之外的 `status` 取值时也以 `2` 结束并指出记录 `id`（提供了合法 `--threshold` 时同样如此，不因已达到阈值而放过）；`--threshold` 本身取值非法（缺值、空值、零、负数、小数、空白或其他字符）在访问数据库前以 `2` 拒绝。阈值判断结果不改变退出码：无论 `threshold_reached` 为 `true` 还是 `false` 均以 `0` 结束。
 
-数据库文件不存在时 `check` 可创建（父目录必须已存在）；`recent` 对不存在的路径（即使父目录也不存在，且不会创建任何文件或目录）、空数据库、没有历史表（包括仅有其他表）的数据库以及历史表存在但无记录的情况均输出 `[]`，库中已有的表与数据保持不变。`streak` 对这些无历史情形（含该目标无匹配记录）输出 `{"url":<输入原文>,"latest_id":null,"consecutive_failures":0}`，同样不创建任何文件、目录或表。
+数据库文件不存在时 `check` 可创建（父目录必须已存在）；`recent` 对不存在的路径（即使父目录也不存在，且不会创建任何文件或目录）、空数据库、没有历史表（包括仅有其他表）的数据库以及历史表存在但无记录的情况均输出 `[]`，库中已有的表与数据保持不变。`streak` 对这些无历史情形（含该目标无匹配记录）输出 `{"url":<输入原文>,"latest_id":null,"consecutive_failures":0}`（提供 `--threshold` 时追加 `"threshold":<整数>,"threshold_reached":false`），同样不创建任何文件、目录或表。
 
 参数：`--timeout` 默认 `1`，须为有限正数秒；`--limit` 默认 `5`，须为正整数。
 
@@ -50,6 +50,11 @@ python3 healthcheck.py --db monitor.sqlite recent
 python3 healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/
 # {"url":"http://127.0.0.1:8765/","latest_id":2,"consecutive_failures":1}
 # 退出码 0；该目标尚无记录时 latest_id 为 null、consecutive_failures 为 0
+
+# 同一查询附加阈值判断：次数 >= 3 时 threshold_reached 为 true（退出码仍为 0）
+python3 healthcheck.py --db monitor.sqlite streak \
+    --url http://127.0.0.1:8765/ --threshold 003
+# {"url":"http://127.0.0.1:8765/","latest_id":2,"consecutive_failures":1,"threshold":3,"threshold_reached":false}
 ```
 
 路径与查询参数同样允许，例如：

@@ -13,6 +13,7 @@
     python healthcheck.py --db monitor.sqlite recent --summary --url http://127.0.0.1:8765/ --status failure --reason timeout --limit 2
     python healthcheck.py --db monitor.sqlite recent --status-summary --limit 2
     python healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/health
+    python healthcheck.py --db monitor.sqlite streak --url http://127.0.0.1:8765/health --threshold 3
 """
 
 import argparse
@@ -64,6 +65,14 @@ REASON_FILTER_CHOICES = (
 # 区别于「完全省略该参数」的 None（None 表示不按该方向筛选）。
 # 两个时间边界共用同一套格式规则与缺值处理，故只需一个哨兵。
 TIME_BOUND_MISSING = object()
+
+# 裸 --threshold（命令行上未给值）时 argparse 注入的哨兵；
+# 区别于「完全省略该参数」的 None（None 表示不做阈值判断，输出原有三字段）
+THRESHOLD_MISSING = object()
+
+# streak 阈值的唯一合法形态：纯 ASCII 十进制数字（允许前导零），
+# 且整体表示的数值必须大于零
+THRESHOLD_DIGITS_RE = re.compile(r"[0-9]+\Z")
 
 # --since 与记录 checked_at 共用的严格 UTC 格式：
 # YYYY-MM-DDTHH:MM:SS，秒后可带一至六位小数，仅以 Z 或 +00:00 结尾；
@@ -287,6 +296,69 @@ def validate_time_bound_filter(name, value):
     if problem is not None:
         die(f"{name} 参数错误：--{name} {problem}，实际值 {value!r}")
     return parse_utc_timestamp(value)
+
+
+def disable_int_digit_limit_for_threshold():
+    """解除 Python 3.11+ 的十进制整数字符串位数限制（默认 4300 位）。
+
+    --threshold 接受任意长度的纯 ASCII 数字文本，输出与 JSON 序列化均按
+    整数表示，故在 streak 路径上解除该限制；只由阈值校验调用，check/recent
+    不经过此处，其既有整数解析行为保持不变。
+    """
+    set_limit = getattr(sys, "set_int_max_str_digits", None)
+    if set_limit is not None:
+        try:
+            set_limit(0)
+        except ValueError:
+            pass
+
+
+def validate_threshold(value):
+    """streak 的 --threshold：None 表示省略（不做阈值判断）。
+
+    提供时只接受纯 ASCII 十进制数字组成且数值大于零的文本（允许前导零）；
+    返回正整数（前导零不保留），输出与比较均按整数进行。缺值（裸参数）、
+    空字符串、零、负数、小数、空白、正号或任何非 ASCII 数字字符均经 die
+    以退出码 2 拒绝（stdout 为空，stderr 指出 threshold 及原因）。该校验
+    在 URL 校验之后、一切数据库访问之前执行，拒绝时不会读取数据库。
+    """
+    if value is None:
+        return None
+    if value is THRESHOLD_MISSING:
+        die(
+            "threshold 参数错误：--threshold 必须提供值，"
+            "为纯数字组成的正整数（允许前导零），实际缺少值"
+        )
+    text = value if isinstance(value, str) else str(value)
+    if not THRESHOLD_DIGITS_RE.fullmatch(text):
+        if text == "":
+            reason = "值不能为空"
+        elif text != text.strip():
+            reason = "前后不允许有空白"
+        else:
+            reason = (
+                "必须是纯 ASCII 十进制数字组成的正整数，"
+                "不接受符号、小数点、空白或其他字符"
+            )
+        die(
+            "threshold 参数错误：--threshold "
+            f"{reason}，实际值 {value!r}"
+        )
+    disable_int_digit_limit_for_threshold()
+    try:
+        threshold = int(text)
+    except ValueError:
+        # 受限解释器不允许解除位数限制、且数字串超长时走到这里
+        die(
+            "threshold 参数错误：--threshold 数值超出可处理范围，"
+            f"实际值 {value!r}"
+        )
+    if threshold <= 0:
+        die(
+            "threshold 参数错误：--threshold 必须大于零，"
+            f"实际值 {value!r}"
+        )
+    return threshold
 
 
 def filter_rows_by_since(rows, since, limit, until=None):
@@ -770,16 +842,22 @@ def count_consecutive_failures(rows):
     return count
 
 
-def render_streak_result(url, latest_id, consecutive_failures):
+def render_streak_result(url, latest_id, consecutive_failures, threshold=None):
     """streak 唯一输出形态：紧凑单行 JSON，字段名与顺序固定。
 
-    url 保留命令行输入原文，不做任何规范化。
+    url 保留命令行输入原文，不做任何规范化。省略 --threshold 时只输出
+    url/latest_id/consecutive_failures 三字段（与既有行为一致）；提供阈值时
+    追加整数 threshold 与布尔 threshold_reached
+    （consecutive_failures >= threshold）。
     """
     payload = {
         "url": url,
         "latest_id": latest_id,
         "consecutive_failures": consecutive_failures,
     }
+    if threshold is not None:
+        payload["threshold"] = threshold
+        payload["threshold_reached"] = consecutive_failures >= threshold
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
@@ -788,12 +866,19 @@ def command_streak(args):
     # 即以退出码 2 拒绝。校验通过即可，匹配仍使用原始字符串，不做规范化。
     validate_target_url(args.url)
 
+    # 再校验 --threshold（纯 ASCII 数字且大于零，允许前导零）：
+    # 缺值、空值、零、负数、小数、空白或其他字符同样在访问数据库前以
+    # 退出码 2 拒绝（stdout 为空，stderr 指出 threshold 及原因）。
+    # None 表示省略：保留原有三字段输出，不做阈值判断。
+    threshold = validate_threshold(args.threshold)
+
     # streak 严格只读：文件尚不存在（含父目录不存在）、空库、无历史表或
-    # 该目标无记录时返回 latest_id 为 null、consecutive_failures 为 0，
-    # 不创建文件、目录或表，不发任何网络请求
+    # 该目标无记录时返回 latest_id 为 null、consecutive_failures 为 0
+    # （提供阈值时 threshold_reached 为 false），不创建文件、目录或表，
+    # 不发任何网络请求
     conn = open_history_db_readonly(args.db)
     if conn is None:
-        render_streak_result(args.url, None, 0)
+        render_streak_result(args.url, None, 0, threshold)
         return 0
 
     try:
@@ -819,6 +904,9 @@ def command_streak(args):
                     consecutive_failures = 0
                 else:
                     latest_id = rows[0][0]
+                    # 连续段内出现非法 status 仍以退出码 2 拒绝并指出 id，
+                    # 即使 failure 次数此前已达到阈值；比首条 success 更旧的
+                    # 记录不会被遍历到，不影响结果
                     consecutive_failures = count_consecutive_failures(rows)
         finally:
             conn.close()
@@ -827,7 +915,9 @@ def command_streak(args):
         # （checks 表缺字段已在查询前由 ensure_checks_columns 单独报告）
         die(f"读取数据库 {args.db!r} 失败: {exc}")
 
-    render_streak_result(args.url, latest_id, consecutive_failures)
+    render_streak_result(
+        args.url, latest_id, consecutive_failures, threshold
+    )
     return 0
 
 
@@ -933,6 +1023,19 @@ def build_parser():
              "（规则同 check：仅 http://127.0.0.1:端口/...）；"
              "连续段只按 id 倒序的保存 status 判定，不支持 recent 的"
              "筛选与限量选项",
+    )
+    p_streak.add_argument(
+        "--threshold",
+        nargs="?",
+        const=THRESHOLD_MISSING,
+        default=None,
+        metavar="N",
+        help="可选：连续失败次数阈值，只接受纯 ASCII 十进制数字组成且大于"
+             "零的文本（允许前导零，输出按整数表示）。省略时输出原有"
+             " url/latest_id/consecutive_failures 三字段；提供时追加整数 "
+             "threshold 与布尔 threshold_reached（连续失败次数大于或等于"
+             "阈值为 true）。裸 --threshold（缺少值）、空值、零、负数、"
+             "小数、空白或其他字符均在访问数据库前以退出码 2 拒绝",
     )
     p_streak.set_defaults(handler=command_streak)
 
